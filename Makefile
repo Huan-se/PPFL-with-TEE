@@ -100,3 +100,4 @@ clean:
 	rm -rf $(OUT_DIR)
 	rm -f App/*.o App/Enclave_u.*
 	rm -f Enclave/*.o Enclave/Enclave_t.*
+
