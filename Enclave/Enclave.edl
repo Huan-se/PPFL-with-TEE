@@ -1,0 +1,33 @@
+/* Enclave/Enclave.edl */
+enclave {
+    from "sgx_tstdc.edl" import *;
+
+    trusted {
+        /*
+         * 核心安全聚合阶段接口
+         * seed:        投影矩阵种子 (保证所有客户端一致)
+         * w_new:       训练后的参数 (扁平化)
+         * w_old:       训练前的参数 (扁平化)
+         * model_len:   参数总长度
+         * ranges:      切片区间数组 [start1, len1, start2, len2, ...]
+         * ranges_len:  区间数组的长度 (即 区间数量 * 2)
+         * output:      输出的摘要 (Digest)
+         * out_len:     摘要长度 (例如 1024)
+         */
+        public void ecall_secure_aggregation_phase(
+            long int seed,
+            [in, count=model_len] float* w_new,
+            [in, count=model_len] float* w_old,
+            size_t model_len,
+            [in, count=ranges_len] int* ranges,
+            size_t ranges_len,
+            [out, count=out_len] float* output,
+            size_t out_len
+        );
+    };
+
+    untrusted {
+        /* 用于 Enclave 内部打印调试信息 */
+        void ocall_print_string([in, string] const char *str);
+    };
+};

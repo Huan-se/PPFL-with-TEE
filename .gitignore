@@ -1,5 +1,6 @@
 data/
 proj/
+/Enclave/include/
 *.pt
 *.pth
 *.npz
