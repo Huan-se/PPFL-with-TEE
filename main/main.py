@@ -18,8 +18,8 @@ from model.Cifar10Net import CIFAR10Net
 from _utils_.poison_loader import PoisonLoader
 from _utils_.dataloader import load_and_split_dataset
 from _utils_.save_config import check_result_exists, save_result_with_config, plot_comparison_curves, get_result_filename
-from entity.Server import Server
-from entity.Client import Client
+from Entity.Server import Server
+from Entity.Client import Client
 
 # 强制设置多进程启动方式
 try:
