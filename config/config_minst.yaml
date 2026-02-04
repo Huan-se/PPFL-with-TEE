@@ -1,0 +1,94 @@
+# config/config.yaml
+
+# ================= 基础实验设置 =================
+experiment:
+  seed: 42
+  save_dir: "results"
+  thread_count: 20
+  device: "cuda"  # auto, cuda, or cpu
+  modes: "all"  #pure_training poison_no_detection poison_with_detection all
+  
+  
+  verbose: true        # 是否开启详细日志
+  log_interval: 100   # 训练时每隔多少个 batch 打印一次进度
+  
+
+# ================= 联邦学习参数 =================
+federated:
+  comm_rounds: 10
+  total_clients: 20
+  active_clients: 20
+  local_epochs: 3
+  batch_size: 64
+  lr: 0.005
+  
+# ================= 数据与模型 =================
+data:
+  dataset: "cifar10"  # mnist, cifar10
+  model: "cifar10"    # lenet5, cifar10
+  if_noniid: false
+  alpha: 0.5          # Non-IID 的狄利克雷分布参数
+
+# ================= 防御策略 =================
+defense:
+  method: "layers_proj_detect" # none, lsh_score_kickout, only_score, only_kickout, layers_proj_detect
+  projection_dim: 1024
+  target_layers: 
+    - "conv1.weight"
+    - "fc3.weight"
+  params:
+    # DBSCAN 聚类参数
+    dbscan_eps: 0.5          # 邻域半径 (Non-IID 越严重，这个值要越大)
+    dbscan_min_samples: 2    # 最小核心点数
+    
+    # 统计筛除参数
+    l2_threshold_multiplier: 2.5  # L2范数阈值倍数 (Median + k * MAD)
+    var_threshold_multiplier: 2.5 # 方差阈值倍数
+    
+    # 评分参数
+    base_good_score: 10.0    # 良性基础分
+    suspect_score: 1.0       # 疑似者惩罚分
+    max_bonus: 10.0          # 最大奖励分
+    strike_threshold: 3      # 累计几次踢出
+
+# ================= 攻击策略配置 =================
+attack:
+  poison_ratio: 0.2
+  # 启用的攻击类型列表 (可多选)
+  active_attacks: 
+    - "random_poison"
+  
+  # 具体攻击参数 
+  params:
+    random_poison:
+      noise_std: 0.5
+      
+    label_flip:
+      source_class: 5
+      target_class: 7
+      scale_update: true
+      scale_factor: 2.0
+      
+    backdoor:
+      backdoor_ratio: 0.1
+      backdoor_target: 0
+      trigger_size: 3
+      scale_update: true
+      scale_factor: 3.0
+      
+    model_compress:
+      compress_ratio: 0.95
+      
+    gradient_amplify:
+      amplify_factor: 5.0
+      
+    gradient_inversion:
+      inversion_strength: 1.0
+      
+    feature_poison:
+      poison_strength: 0.3
+      perturb_dim: 100
+      
+    batch_poison:
+      poison_ratio: 0.2
+      batch_noise_std: 0.1
