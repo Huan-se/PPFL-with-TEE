@@ -1,4 +1,4 @@
-# entity/Client.py
+# Entity/Client.py
 import torch
 import torch.nn as nn
 import torch.optim as optim

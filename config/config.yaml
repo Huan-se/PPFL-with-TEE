@@ -18,7 +18,7 @@ experiment:
 
 # ================= 联邦学习参数 =================
 federated:
-  comm_rounds: 100
+  comm_rounds: 1
   total_clients: 20
   active_clients: 20
   local_epochs: 3

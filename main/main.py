@@ -88,30 +88,41 @@ def print_configuration_summary(mode_name, current_mode_config, full_config):
 # =======================================================
 # 核心任务函数 (Phase 1)
 # =======================================================
-def task_client_train_and_project(client, global_params_cpu, proj_path, target_layers, device_str):
+def task_client_train_and_project(client, global_params_cpu, proj_seed, target_layers, device_str):
     try:
         device = torch.device(device_str)
+        # 1. 模型加载到 GPU
         if client.model is None:
             client.model = client.model_class().to(device)
         else:
             client.model = client.model.to(device)
         
         global_params_device = {k: v.to(device) for k, v in global_params_cpu.items()}
-        client.receive_model_and_proj(global_params_device, proj_path)
+        
+        # [修复1] 传入整数种子 (proj_seed)，而不是路径
+        client.receive_model_and_proj(global_params_device, proj_seed)
+        
         _ = client.local_train()
+        
+        # 2. 生成投影 (返回的是 numpy 数组)
         feature_dict = client.generate_gradient_projection(target_layers=target_layers)
         
+        # [修复2] 将 numpy 数组转换为 Tensor，避免调用 .cpu()
+        # TEE 返回的已经是 CPU 上的 numpy，直接 torch.from_numpy 即可
         feature_dict_cpu = {
-            'full': feature_dict['full'].cpu(),
+            'full': torch.from_numpy(feature_dict['full']), 
             'layers': {}
         }
+        
         if 'layers' in feature_dict:
             for k, v in feature_dict['layers'].items():
-                feature_dict_cpu['layers'][k] = v.cpu()
+                feature_dict_cpu['layers'][k] = torch.from_numpy(v)
         
+        # 3. 处理模型参数 (已经是 Tensor)
         trained_params_cpu = {k: v.cpu() for k, v in client.model.state_dict().items()}
         data_size = len(client.dataloader.dataset)
         
+        # 清理显存
         client.model.cpu() 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -248,7 +259,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     start_time = time.time()
     
     for r in range(1, total_rounds + 1):
-        global_params, proj_path = server.get_global_params_and_proj()
+        global_params, _ = server.get_global_params_and_proj()
         active_ids = random.sample(range(fed_conf['total_clients']), fed_conf['active_clients'])
         
         if use_multiprocessing:
@@ -258,6 +269,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             
         round_results_buffer = {}
         round_params_buffer = {}
+        current_seed = int(exp_conf['seed'])
         
         with ExecutorClass(max_workers=worker_count) as executor:
             futures = {
@@ -265,7 +277,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
                     task_client_train_and_project, 
                     clients[cid], 
                     global_params_for_worker, 
-                    proj_path, 
+                    current_seed, 
                     target_layers_config,
                     device_str
                 ): cid 
