@@ -4,9 +4,9 @@ import csv
 import os
 from collections import defaultdict
 from _utils_.LSH_proj_extra import SuperBitLSH
-from defence.score import ScoreCalculator
-from defence.kickout import KickoutManager
-from defence.layers_proj_detect import Layers_Proj_Detector
+from Defence.score import ScoreCalculator
+from Defence.kickout import KickoutManager
+from Defence.layers_proj_detect import Layers_Proj_Detector
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
