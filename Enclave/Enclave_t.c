@@ -38,6 +38,27 @@ typedef struct ms_ecall_secure_aggregation_phase_t {
 	size_t ms_out_len;
 } ms_ecall_secure_aggregation_phase_t;
 
+typedef struct ms_ecall_generate_masked_gradient_t {
+	long int ms_seed_r;
+	long int ms_seed_b;
+	float ms_weight;
+	float* ms_w_new;
+	float* ms_w_old;
+	size_t ms_model_len;
+	int* ms_ranges;
+	size_t ms_ranges_len;
+	float* ms_output;
+	size_t ms_out_len;
+} ms_ecall_generate_masked_gradient_t;
+
+typedef struct ms_ecall_get_recovery_share_t {
+	long int ms_seed_sss;
+	float ms_secret_val;
+	int ms_threshold;
+	int ms_target_x;
+	float* ms_share_val;
+} ms_ecall_get_recovery_share_t;
+
 typedef struct ms_ocall_print_string_t {
 	const char* ms_str;
 } ms_ocall_print_string_t;
@@ -209,28 +230,221 @@ err:
 	return status;
 }
 
+static sgx_status_t SGX_CDECL sgx_ecall_generate_masked_gradient(void* pms)
+{
+	CHECK_REF_POINTER(pms, sizeof(ms_ecall_generate_masked_gradient_t));
+	//
+	// fence after pointer checks
+	//
+	sgx_lfence();
+	ms_ecall_generate_masked_gradient_t* ms = SGX_CAST(ms_ecall_generate_masked_gradient_t*, pms);
+	sgx_status_t status = SGX_SUCCESS;
+	float* _tmp_w_new = ms->ms_w_new;
+	size_t _tmp_model_len = ms->ms_model_len;
+	size_t _len_w_new = _tmp_model_len * sizeof(float);
+	float* _in_w_new = NULL;
+	float* _tmp_w_old = ms->ms_w_old;
+	size_t _len_w_old = _tmp_model_len * sizeof(float);
+	float* _in_w_old = NULL;
+	int* _tmp_ranges = ms->ms_ranges;
+	size_t _tmp_ranges_len = ms->ms_ranges_len;
+	size_t _len_ranges = _tmp_ranges_len * sizeof(int);
+	int* _in_ranges = NULL;
+	float* _tmp_output = ms->ms_output;
+	size_t _tmp_out_len = ms->ms_out_len;
+	size_t _len_output = _tmp_out_len * sizeof(float);
+	float* _in_output = NULL;
+
+	if (sizeof(*_tmp_w_new) != 0 &&
+		(size_t)_tmp_model_len > (SIZE_MAX / sizeof(*_tmp_w_new))) {
+		return SGX_ERROR_INVALID_PARAMETER;
+	}
+
+	if (sizeof(*_tmp_w_old) != 0 &&
+		(size_t)_tmp_model_len > (SIZE_MAX / sizeof(*_tmp_w_old))) {
+		return SGX_ERROR_INVALID_PARAMETER;
+	}
+
+	if (sizeof(*_tmp_ranges) != 0 &&
+		(size_t)_tmp_ranges_len > (SIZE_MAX / sizeof(*_tmp_ranges))) {
+		return SGX_ERROR_INVALID_PARAMETER;
+	}
+
+	if (sizeof(*_tmp_output) != 0 &&
+		(size_t)_tmp_out_len > (SIZE_MAX / sizeof(*_tmp_output))) {
+		return SGX_ERROR_INVALID_PARAMETER;
+	}
+
+	CHECK_UNIQUE_POINTER(_tmp_w_new, _len_w_new);
+	CHECK_UNIQUE_POINTER(_tmp_w_old, _len_w_old);
+	CHECK_UNIQUE_POINTER(_tmp_ranges, _len_ranges);
+	CHECK_UNIQUE_POINTER(_tmp_output, _len_output);
+
+	//
+	// fence after pointer checks
+	//
+	sgx_lfence();
+
+	if (_tmp_w_new != NULL && _len_w_new != 0) {
+		if ( _len_w_new % sizeof(*_tmp_w_new) != 0)
+		{
+			status = SGX_ERROR_INVALID_PARAMETER;
+			goto err;
+		}
+		_in_w_new = (float*)malloc(_len_w_new);
+		if (_in_w_new == NULL) {
+			status = SGX_ERROR_OUT_OF_MEMORY;
+			goto err;
+		}
+
+		if (memcpy_s(_in_w_new, _len_w_new, _tmp_w_new, _len_w_new)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+
+	}
+	if (_tmp_w_old != NULL && _len_w_old != 0) {
+		if ( _len_w_old % sizeof(*_tmp_w_old) != 0)
+		{
+			status = SGX_ERROR_INVALID_PARAMETER;
+			goto err;
+		}
+		_in_w_old = (float*)malloc(_len_w_old);
+		if (_in_w_old == NULL) {
+			status = SGX_ERROR_OUT_OF_MEMORY;
+			goto err;
+		}
+
+		if (memcpy_s(_in_w_old, _len_w_old, _tmp_w_old, _len_w_old)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+
+	}
+	if (_tmp_ranges != NULL && _len_ranges != 0) {
+		if ( _len_ranges % sizeof(*_tmp_ranges) != 0)
+		{
+			status = SGX_ERROR_INVALID_PARAMETER;
+			goto err;
+		}
+		_in_ranges = (int*)malloc(_len_ranges);
+		if (_in_ranges == NULL) {
+			status = SGX_ERROR_OUT_OF_MEMORY;
+			goto err;
+		}
+
+		if (memcpy_s(_in_ranges, _len_ranges, _tmp_ranges, _len_ranges)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+
+	}
+	if (_tmp_output != NULL && _len_output != 0) {
+		if ( _len_output % sizeof(*_tmp_output) != 0)
+		{
+			status = SGX_ERROR_INVALID_PARAMETER;
+			goto err;
+		}
+		if ((_in_output = (float*)malloc(_len_output)) == NULL) {
+			status = SGX_ERROR_OUT_OF_MEMORY;
+			goto err;
+		}
+
+		memset((void*)_in_output, 0, _len_output);
+	}
+
+	ecall_generate_masked_gradient(ms->ms_seed_r, ms->ms_seed_b, ms->ms_weight, _in_w_new, _in_w_old, _tmp_model_len, _in_ranges, _tmp_ranges_len, _in_output, _tmp_out_len);
+	if (_in_output) {
+		if (memcpy_s(_tmp_output, _len_output, _in_output, _len_output)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+	}
+
+err:
+	if (_in_w_new) free(_in_w_new);
+	if (_in_w_old) free(_in_w_old);
+	if (_in_ranges) free(_in_ranges);
+	if (_in_output) free(_in_output);
+	return status;
+}
+
+static sgx_status_t SGX_CDECL sgx_ecall_get_recovery_share(void* pms)
+{
+	CHECK_REF_POINTER(pms, sizeof(ms_ecall_get_recovery_share_t));
+	//
+	// fence after pointer checks
+	//
+	sgx_lfence();
+	ms_ecall_get_recovery_share_t* ms = SGX_CAST(ms_ecall_get_recovery_share_t*, pms);
+	sgx_status_t status = SGX_SUCCESS;
+	float* _tmp_share_val = ms->ms_share_val;
+	size_t _len_share_val = 1 * sizeof(float);
+	float* _in_share_val = NULL;
+
+	if (sizeof(*_tmp_share_val) != 0 &&
+		1 > (SIZE_MAX / sizeof(*_tmp_share_val))) {
+		return SGX_ERROR_INVALID_PARAMETER;
+	}
+
+	CHECK_UNIQUE_POINTER(_tmp_share_val, _len_share_val);
+
+	//
+	// fence after pointer checks
+	//
+	sgx_lfence();
+
+	if (_tmp_share_val != NULL && _len_share_val != 0) {
+		if ( _len_share_val % sizeof(*_tmp_share_val) != 0)
+		{
+			status = SGX_ERROR_INVALID_PARAMETER;
+			goto err;
+		}
+		if ((_in_share_val = (float*)malloc(_len_share_val)) == NULL) {
+			status = SGX_ERROR_OUT_OF_MEMORY;
+			goto err;
+		}
+
+		memset((void*)_in_share_val, 0, _len_share_val);
+	}
+
+	ecall_get_recovery_share(ms->ms_seed_sss, ms->ms_secret_val, ms->ms_threshold, ms->ms_target_x, _in_share_val);
+	if (_in_share_val) {
+		if (memcpy_s(_tmp_share_val, _len_share_val, _in_share_val, _len_share_val)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+	}
+
+err:
+	if (_in_share_val) free(_in_share_val);
+	return status;
+}
+
 SGX_EXTERNC const struct {
 	size_t nr_ecall;
-	struct {void* ecall_addr; uint8_t is_priv; uint8_t is_switchless;} ecall_table[1];
+	struct {void* ecall_addr; uint8_t is_priv; uint8_t is_switchless;} ecall_table[3];
 } g_ecall_table = {
-	1,
+	3,
 	{
 		{(void*)(uintptr_t)sgx_ecall_secure_aggregation_phase, 0, 0},
+		{(void*)(uintptr_t)sgx_ecall_generate_masked_gradient, 0, 0},
+		{(void*)(uintptr_t)sgx_ecall_get_recovery_share, 0, 0},
 	}
 };
 
 SGX_EXTERNC const struct {
 	size_t nr_ocall;
-	uint8_t entry_table[6][1];
+	uint8_t entry_table[6][3];
 } g_dyn_entry_table = {
 	6,
 	{
-		{0, },
-		{0, },
-		{0, },
-		{0, },
-		{0, },
-		{0, },
+		{0, 0, 0, },
+		{0, 0, 0, },
+		{0, 0, 0, },
+		{0, 0, 0, },
+		{0, 0, 0, },
+		{0, 0, 0, },
 	}
 };
 

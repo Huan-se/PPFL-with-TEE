@@ -145,6 +145,43 @@ class Client:
             else:
                 weighted_params[key] = param 
         return weighted_params
+    
+    def secure_upload_masked(self, weight, seed_r, seed_b):
+        """
+        调用 TEE 生成 C_i = k * w + r + b
+        """
+        if self.w_old_flat is None:
+             # 如果是第一轮，可能没有 old，或者 w_old = initial_params
+             # 这里假设 w_old 已经在 receive_model 时保存了
+             pass
+
+        w_new_flat = self._flatten_model_params(self.model)
+        
+        # 调用 Adapter
+        # ranges 设为 None 表示全量处理，也可以传 self.layer_indices
+        encrypted_grad = self.tee_adapter.generate_masked_gradient(
+            seed_r=seed_r,
+            seed_b=seed_b,
+            weight=weight,
+            w_new_flat=w_new_flat,
+            w_old_flat=self.w_old_flat,
+            ranges=None 
+        )
+        return encrypted_grad
+
+    # [新增] 执行掉线恢复 (Phase 5)
+    def perform_recovery(self, seed_sss, delta_val, threshold, target_client_id):
+        """
+        帮助恢复掉线者造成的影响
+        target_client_id: 我们需要计算 P(target_id)
+        """
+        share = self.tee_adapter.get_recovery_share(
+            seed_sss=seed_sss,
+            secret_val=delta_val, # 这里传入大家都知道的 Delta
+            threshold=threshold,
+            target_x=target_client_id
+        )
+        return share
 
     def __del__(self):
         # 析构时尝试关闭 Enclave

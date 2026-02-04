@@ -1,7 +1,7 @@
 {
     "total_clients": 20,
     "batch_size": 64,
-    "comm_rounds": 1,
+    "comm_rounds": 10,
     "if_noniid": false,
     "alpha": 0.5,
     "attack_types": [

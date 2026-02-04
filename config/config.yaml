@@ -9,7 +9,7 @@ experiment:
   use_multiprocessing: true
   
   device: "cuda"  # auto, cuda, or cpu
-  modes: "all"  #pure_training poison_no_detection poison_with_detection all
+  modes: "poison_with_detection"  #pure_training poison_no_detection poison_with_detection all
   
   
   verbose: true        # 是否开启详细日志
@@ -18,7 +18,7 @@ experiment:
 
 # ================= 联邦学习参数 =================
 federated:
-  comm_rounds: 1
+  comm_rounds: 10
   total_clients: 20
   active_clients: 20
   local_epochs: 3

@@ -42,6 +42,8 @@ int SGX_UBRIDGE(SGX_CDECL, sgx_thread_set_multiple_untrusted_events_ocall, (cons
 #endif
 
 sgx_status_t ecall_secure_aggregation_phase(sgx_enclave_id_t eid, long int seed, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output, size_t out_len);
+sgx_status_t ecall_generate_masked_gradient(sgx_enclave_id_t eid, long int seed_r, long int seed_b, float weight, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output, size_t out_len);
+sgx_status_t ecall_get_recovery_share(sgx_enclave_id_t eid, long int seed_sss, float secret_val, int threshold, int target_x, float* share_val);
 
 #ifdef __cplusplus
 }

@@ -3,19 +3,11 @@ enclave {
     from "sgx_tstdc.edl" import *;
 
     trusted {
-        /*
-         * 核心安全聚合阶段接口
-         * seed:        投影矩阵种子 (保证所有客户端一致)
-         * w_new:       训练后的参数 (扁平化)
-         * w_old:       训练前的参数 (扁平化)
-         * model_len:   参数总长度
-         * ranges:      切片区间数组 [start1, len1, start2, len2, ...]
-         * ranges_len:  区间数组的长度 (即 区间数量 * 2)
-         * output:      输出的摘要 (Digest)
-         * out_len:     摘要长度 (例如 1024)
+        /* * [Phase 2/3] 现有的投影接口 (LSH Projection) 
+         * 用于生成梯度摘要，供服务器做聚类或检测
          */
         public void ecall_secure_aggregation_phase(
-            long int seed,
+            long seed,
             [in, count=model_len] float* w_new,
             [in, count=model_len] float* w_old,
             size_t model_len,
@@ -24,10 +16,37 @@ enclave {
             [out, count=out_len] float* output,
             size_t out_len
         );
+
+        /* * [Phase 4] 新增：双掩码梯度生成 (Double Masking)
+         * 用于生成加噪后的梯度 C_i = k_i * w_i + r_i + b_i
+         * output 的长度应当与 model_len (或切片总长) 一致
+         */
+        public void ecall_generate_masked_gradient(
+            long seed_r,    /* 私有掩码种子 */
+            long seed_b,    /* 互掩码种子 */
+            float weight,   /* 聚合权重 k_i */
+            [in, count=model_len] float* w_new,
+            [in, count=model_len] float* w_old,
+            size_t model_len,
+            [in, count=ranges_len] int* ranges,
+            size_t ranges_len,
+            [out, count=out_len] float* output, /* 输出 C_i */
+            size_t out_len
+        );
+
+        /* * [Phase 5] 新增：掉线恢复 (SSS Recovery)
+         * 计算 Delta 的秘密分片
+         */
+        public void ecall_get_recovery_share(
+            long seed_sss,
+            float secret_val,
+            int threshold,
+            int target_x,
+            [out, count=1] float* share_val
+        );
     };
 
     untrusted {
-        /* 用于 Enclave 内部打印调试信息 */
         void ocall_print_string([in, string] const char *str);
     };
 };
