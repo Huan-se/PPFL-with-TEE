@@ -1,37 +1,39 @@
 #include "Enclave_u.h"
 #include <errno.h>
 
-typedef struct ms_ecall_secure_aggregation_phase_t {
-	long int ms_seed;
+typedef struct ms_ecall_prepare_gradient_t {
+	int ms_client_id;
+	long int ms_proj_seed;
 	float* ms_w_new;
 	float* ms_w_old;
 	size_t ms_model_len;
 	int* ms_ranges;
 	size_t ms_ranges_len;
-	float* ms_output;
+	float* ms_output_proj;
 	size_t ms_out_len;
-} ms_ecall_secure_aggregation_phase_t;
+} ms_ecall_prepare_gradient_t;
 
-typedef struct ms_ecall_generate_masked_gradient_t {
-	long int ms_seed_r;
-	long int ms_seed_b;
-	float ms_weight;
-	float* ms_w_new;
-	float* ms_w_old;
+typedef struct ms_ecall_generate_masked_gradient_dynamic_t {
+	long int ms_seed_mask_root;
+	long int ms_seed_global_0;
+	int ms_client_id;
+	float ms_k_weight;
+	float ms_n_ratio;
 	size_t ms_model_len;
 	int* ms_ranges;
 	size_t ms_ranges_len;
-	float* ms_output;
+	long long* ms_output;
 	size_t ms_out_len;
-} ms_ecall_generate_masked_gradient_t;
+} ms_ecall_generate_masked_gradient_dynamic_t;
 
-typedef struct ms_ecall_get_recovery_share_t {
+typedef struct ms_ecall_get_vector_shares_dynamic_t {
 	long int ms_seed_sss;
-	float ms_secret_val;
+	long int ms_seed_mask_root;
+	int ms_target_client_id;
 	int ms_threshold;
-	int ms_target_x;
-	float* ms_share_val;
-} ms_ecall_get_recovery_share_t;
+	int ms_total_clients;
+	struct SharePackage* ms_output_shares;
+} ms_ecall_get_vector_shares_dynamic_t;
 
 typedef struct ms_ocall_print_string_t {
 	const char* ms_str;
@@ -127,31 +129,32 @@ static const struct {
 		(void*)Enclave_sgx_thread_set_multiple_untrusted_events_ocall,
 	}
 };
-sgx_status_t ecall_secure_aggregation_phase(sgx_enclave_id_t eid, long int seed, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output, size_t out_len)
+sgx_status_t ecall_prepare_gradient(sgx_enclave_id_t eid, int client_id, long int proj_seed, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output_proj, size_t out_len)
 {
 	sgx_status_t status;
-	ms_ecall_secure_aggregation_phase_t ms;
-	ms.ms_seed = seed;
+	ms_ecall_prepare_gradient_t ms;
+	ms.ms_client_id = client_id;
+	ms.ms_proj_seed = proj_seed;
 	ms.ms_w_new = w_new;
 	ms.ms_w_old = w_old;
 	ms.ms_model_len = model_len;
 	ms.ms_ranges = ranges;
 	ms.ms_ranges_len = ranges_len;
-	ms.ms_output = output;
+	ms.ms_output_proj = output_proj;
 	ms.ms_out_len = out_len;
 	status = sgx_ecall(eid, 0, &ocall_table_Enclave, &ms);
 	return status;
 }
 
-sgx_status_t ecall_generate_masked_gradient(sgx_enclave_id_t eid, long int seed_r, long int seed_b, float weight, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output, size_t out_len)
+sgx_status_t ecall_generate_masked_gradient_dynamic(sgx_enclave_id_t eid, long int seed_mask_root, long int seed_global_0, int client_id, float k_weight, float n_ratio, size_t model_len, int* ranges, size_t ranges_len, long long* output, size_t out_len)
 {
 	sgx_status_t status;
-	ms_ecall_generate_masked_gradient_t ms;
-	ms.ms_seed_r = seed_r;
-	ms.ms_seed_b = seed_b;
-	ms.ms_weight = weight;
-	ms.ms_w_new = w_new;
-	ms.ms_w_old = w_old;
+	ms_ecall_generate_masked_gradient_dynamic_t ms;
+	ms.ms_seed_mask_root = seed_mask_root;
+	ms.ms_seed_global_0 = seed_global_0;
+	ms.ms_client_id = client_id;
+	ms.ms_k_weight = k_weight;
+	ms.ms_n_ratio = n_ratio;
 	ms.ms_model_len = model_len;
 	ms.ms_ranges = ranges;
 	ms.ms_ranges_len = ranges_len;
@@ -161,15 +164,16 @@ sgx_status_t ecall_generate_masked_gradient(sgx_enclave_id_t eid, long int seed_
 	return status;
 }
 
-sgx_status_t ecall_get_recovery_share(sgx_enclave_id_t eid, long int seed_sss, float secret_val, int threshold, int target_x, float* share_val)
+sgx_status_t ecall_get_vector_shares_dynamic(sgx_enclave_id_t eid, long int seed_sss, long int seed_mask_root, int target_client_id, int threshold, int total_clients, struct SharePackage* output_shares)
 {
 	sgx_status_t status;
-	ms_ecall_get_recovery_share_t ms;
+	ms_ecall_get_vector_shares_dynamic_t ms;
 	ms.ms_seed_sss = seed_sss;
-	ms.ms_secret_val = secret_val;
+	ms.ms_seed_mask_root = seed_mask_root;
+	ms.ms_target_client_id = target_client_id;
 	ms.ms_threshold = threshold;
-	ms.ms_target_x = target_x;
-	ms.ms_share_val = share_val;
+	ms.ms_total_clients = total_clients;
+	ms.ms_output_shares = output_shares;
 	status = sgx_ecall(eid, 2, &ocall_table_Enclave, &ms);
 	return status;
 }

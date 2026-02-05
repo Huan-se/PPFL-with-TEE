@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 动态添加路径
@@ -21,7 +22,7 @@ from _utils_.dataloader import get_dataloader
 from _utils_.poison_loader import PoisonLoader
 from model.Cifar10Net import CIFAR10Net
 from model.Lenet5 import LeNet5
-from _utils_.save_config import save_config, save_results
+from _utils_.save_config import save_result_with_config
 
 # ==========================================
 # 全局常量
@@ -81,7 +82,26 @@ def lagrange_interpolate(shares, x=0):
     return secret
 
 # ==========================================
-# 任务函数 (Thread Safe)
+# 辅助类：投毒数据加载器包装器
+# ==========================================
+class PoisonedDataLoaderWrapper:
+    """包装 DataLoader 以在迭代时动态应用投毒"""
+    def __init__(self, dataloader, poison_loader):
+        self.dataloader = dataloader
+        self.poison_loader = poison_loader
+        self.dataset = dataloader.dataset # 兼容性
+
+    def __iter__(self):
+        for data, target in self.dataloader:
+            # 动态应用数据投毒
+            data_p, target_p = self.poison_loader.apply_data_poison(data, target)
+            yield data_p, target_p
+
+    def __len__(self):
+        return len(self.dataloader)
+
+# ==========================================
+# 并行任务 (Thread Safe)
 # ==========================================
 
 def task_tee_step1_train_prepare(client, global_params_cpu, w_old_flat, proj_seed, target_layers, device_str):
@@ -175,15 +195,46 @@ def run_single_mode(config, mode_name, mode_config):
     elif data_conf['model'] == 'mnist': ModelClass = LeNet5
     else: raise ValueError(f"Unknown model: {data_conf['model']}")
         
+    # [修正] 投毒模块初始化逻辑
     poison_loader = None
-    malicious_clients = []
-    if atk_conf['active_attacks']:
-        print(f"  [Attack] Initializing PoisonLoader: {atk_conf['active_attacks']}...")
-        poison_loader = PoisonLoader(atk_conf, train_loaders)
-        malicious_clients = poison_loader.get_poisoned_clients()
-        print(f"  [Attack] Malicious Clients: {malicious_clients}")
+    malicious_clients_list = []
+    
+    if atk_conf.get('active_attacks'):
+        attack_methods = atk_conf['active_attacks']
+        if isinstance(attack_methods, str): attack_methods = [attack_methods]
+        
+        print(f"  [Attack] Initializing PoisonLoader: {attack_methods}...")
+        # 修正1: 正确传递参数 (methods list, params dict)
+        poison_loader = PoisonLoader(attack_methods, atk_conf)
+        
+        # 修正2: 手动选择恶意客户端 (PoisonLoader类中未包含此逻辑)
+        # 默认使用 atk_conf['poison_ratio'] 作为恶意客户端比例
+        p_ratio = atk_conf.get('poison_ratio', 0.0)
+        num_malicious = int(fed_conf['total_clients'] * p_ratio)
+        if num_malicious > 0:
+            malicious_clients_list = sorted(random.sample(range(fed_conf['total_clients']), num_malicious))
+        
+        # 修正3: 动态注入方法以适配 Client.py 的调用接口
+        # Client.py 需要: is_poisoned_client(uid), get_poisoned_dataloader(uid, loader)
+        poison_loader.malicious_set = set(malicious_clients_list)
+        
+        def is_poisoned_client(uid):
+            return uid in poison_loader.malicious_set
+        
+        def get_poisoned_dataloader(uid, origin_loader):
+            # 返回一个包装器，在迭代时应用 apply_data_poison
+            return PoisonedDataLoaderWrapper(origin_loader, poison_loader)
+            
+        # Monkey patch 绑定方法
+        poison_loader.is_poisoned_client = is_poisoned_client
+        poison_loader.get_poisoned_dataloader = get_poisoned_dataloader
+        
+        print(f"  [Attack] Malicious Clients ({len(malicious_clients_list)}): {malicious_clients_list}")
 
-    log_name = f"{mode_name}_{data_conf['dataset']}_{data_conf['model']}_{mode_config.get('method', 'none')}_{atk_conf['active_attacks'] or 'NoAttack'}_p{atk_conf['poison_ratio']:.2f}_{'NonIID' if data_conf['if_noniid'] else 'IID'}"
+    detection_method = mode_name if "detection" in mode_name else "none"
+    if mode_name == 'pure_training': detection_method = "none"
+    
+    log_name = f"{mode_name}_{data_conf['dataset']}_{data_conf['model']}_{detection_method}_{atk_conf['active_attacks'] or 'NoAttack'}_p{atk_conf['poison_ratio']:.2f}_{'NonIID' if data_conf['if_noniid'] else 'IID'}"
     log_path = os.path.join(current_dir, "results", f"{log_name}_detection_log.csv")
     
     server = Server(
@@ -195,13 +246,10 @@ def run_single_mode(config, mode_name, mode_config):
         seed=seed,
         verbose=True,
         log_file_path=log_path,
-        malicious_clients=malicious_clients
+        malicious_clients=malicious_clients_list
     )
     
-    # [修正] 调用 save_config 而不是 save_config_file
-    save_result_with_config(config, os.path.join(current_dir, "results", f"{log_name}_config.json"))
-    
-    # [关键] 全局初始化 Enclave
+    # Global Enclave Init
     from _utils_.tee_adapter import TEEAdapter
     try:
         dummy_adapter = TEEAdapter()
@@ -212,6 +260,7 @@ def run_single_mode(config, mode_name, mode_config):
 
     clients = []
     for i in range(fed_conf['total_clients']):
+        # 传入修复后的 poison_loader
         c = Client(i, train_loaders[i], ModelClass, poison_loader)
         c.tee_adapter = TEEAdapter() 
         c.tee_adapter.initialized = True 
@@ -220,6 +269,9 @@ def run_single_mode(config, mode_name, mode_config):
     current_w_old_flat = flatten_params(server.global_model)
     total_rounds = fed_conf['comm_rounds']
     target_layers_config = mode_config.get('target_layers', None)
+    
+    acc_history = []
+    asr_history = []
     
     # === Main Loop ===
     for r in range(1, total_rounds + 1):
@@ -355,17 +407,33 @@ def run_single_mode(config, mode_name, mode_config):
         current_w_old_flat = flatten_params(server.global_model)
 
         acc, loss = server.evaluate()
+        acc_history.append(acc)
         print(f"  [Round {r}] Global Acc: {acc:.2f}%, Loss: {loss:.4f} | Time: {time.time()-start_time:.1f}s")
         
         if atk_conf['active_attacks']:
             asr = server.evaluate_asr(test_loader, atk_conf['active_attacks'], atk_conf['attack_params'])
+            asr_history.append(asr)
             print(f"  [Round {r}] ASR: {asr:.2f}%")
+        else:
+            asr_history.append(0.0)
+
+        # 保存检查点
+        save_result_with_config(
+            os.path.join(current_dir, "results"),
+            mode_name,
+            data_conf['model'],
+            data_conf['dataset'],
+            detection_method,
+            config,
+            acc_history,
+            asr_history
+        )
 
     print(f"\n[Done] Mode {mode_name} Finished.")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='config/config.yaml')
+    parser.add_argument('--config', type=str, default='../config/config.yaml')
     args = parser.parse_args()
     config = load_config(args.config)
     

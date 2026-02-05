@@ -22,8 +22,7 @@ def get_transform(dataset_name):
 
 def load_dataset(dataset_name, data_dir="./data"):
     """加载指定数据集的训练集和测试集"""
-    from torchvision import datasets, transforms
-
+    # 这里的 transforms 引用是多余的，已经在上面导入
     transform = get_transform(dataset_name)
 
     if dataset_name == "mnist":
@@ -62,7 +61,6 @@ def split_iid(dataset, num_clients, batch_size):
         client_indices[i].append(remaining[i])
 
     # 创建数据加载器
-    from torch.utils.data import Subset, DataLoader
     client_dataloaders = []
     for indices in client_indices:
         # 确保数据量不小于批次大小
@@ -95,20 +93,25 @@ def split_noniid(dataset, num_clients, batch_size, dataset_name, alpha=0.1):
         dirichlet_weights = np.random.dirichlet(np.ones(num_clients) * alpha)
         class_size = len(class_indices[c])
         # 按权重划分当前类别的数据
-        client_split = np.split(
-            class_indices[c],
-            np.cumsum(dirichlet_weights[:-1] * class_size).astype(int)
-        )
-        for i, idx in enumerate(client_split):
-            client_indices[i].extend(idx.tolist())
+        # 防止 split 空数组报错
+        if class_size > 0:
+            split_points = np.cumsum(dirichlet_weights[:-1] * class_size).astype(int)
+            client_split = np.split(class_indices[c], split_points)
+            for i, idx in enumerate(client_split):
+                client_indices[i].extend(idx.tolist())
 
     # 创建数据加载器
-    from torch.utils.data import Subset, DataLoader
     client_dataloaders = []
     for indices in client_indices:
+        # 即使某个客户端分到的数据很少，也要处理
+        if len(indices) == 0:
+            # 极端情况：分配少量随机数据防止报错
+            indices = np.random.choice(len(dataset), batch_size).tolist()
+        
         if len(indices) < batch_size:
             while len(indices) < batch_size:
                 indices.extend(indices[:min(len(indices), batch_size - len(indices))])
+        
         subset = Subset(dataset, indices)
         client_dataloaders.append(
             DataLoader(subset, batch_size=batch_size, shuffle=True)
@@ -117,37 +120,33 @@ def split_noniid(dataset, num_clients, batch_size, dataset_name, alpha=0.1):
     return client_dataloaders
 
 
-def load_and_split_dataset(dataset_name, num_clients, batch_size, if_noniid=True, alpha=0.1, data_dir="./data"):
+def get_dataloader(dataset_name, num_users, batch_size, non_iid=True, alpha=0.1, data_dir="./data"):
     """
     统一接口：加载并划分数据集
+    (已重命名为 get_dataloader 并调整参数名以匹配 main.py)
 
     参数:
-        dataset_name: 数据集名称 ("mnist" 或 "cifar10")
-        num_clients: 客户端数量
+        dataset_name: 数据集名称
+        num_users: 客户端数量 (对应 main.py 的 num_users)
         batch_size: 批次大小
-        if_noniid: 是否使用Non-IID划分
-        alpha: Dirichlet分布参数（仅Non-IID时有效）
-        data_dir: 数据存储路径
-
-    返回:
-        client_dataloaders: 客户端数据加载器列表
-        test_loader: 测试集数据加载器
+        non_iid: 是否使用Non-IID划分 (对应 main.py 的 non_iid)
+        alpha: Dirichlet参数
+        data_dir: 数据路径
     """
     # 加载原始数据集
     train_dataset, test_dataset = load_dataset(dataset_name, data_dir)
 
     # 划分训练集
-    if if_noniid:
+    if non_iid:
         client_dataloaders = split_noniid(
-            train_dataset, num_clients, batch_size, dataset_name, alpha
+            train_dataset, num_users, batch_size, dataset_name, alpha
         )
     else:
         client_dataloaders = split_iid(
-            train_dataset, num_clients, batch_size
+            train_dataset, num_users, batch_size
         )
 
     # 创建测试集加载器
-    from torch.utils.data import DataLoader
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
     return client_dataloaders, test_loader

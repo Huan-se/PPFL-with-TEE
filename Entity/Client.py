@@ -1,189 +1,164 @@
-# Entity/Client.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from _utils_.poison_loader import PoisonLoader
-from _utils_.tee_adapter import TEEAdapter 
+import copy
+
+# 尝试导入 TEE Adapter，如果环境不支持则在运行时报错
+try:
+    from _utils_.tee_adapter import TEEAdapter
+except ImportError:
+    TEEAdapter = None
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class Client:
-    def __init__(self, client_id, dataloader, model_class, poison_loader=None, verbose=False, log_interval=100):
+class Client(object):
+    def __init__(self, client_id, dataloader, model_class, poison_loader=None, verbose=False):
         self.client_id = client_id
         self.dataloader = dataloader
-        self.model_class = model_class
-        self.poison_loader = poison_loader or PoisonLoader()
-        
-        self.model = None
-        self.optimizer = None
-        
-        # [修改] 替换 SuperBitLSH 为 TEEAdapter
-        self.tee_adapter = TEEAdapter() 
-        self.tee_adapter.initialize_enclave() # 启动 SGX
-        
-        # 保存用于 TEE 计算的旧参数 (w_old)
-        self.w_old_flat = None 
-        self.layer_indices = None
-        
-        # 保存投影种子 (从服务器接收)
-        self.proj_seed = 42 
-        
+        self.model = model_class().to(DEVICE)
+        self.poison_loader = poison_loader # 保留投毒模块
         self.verbose = verbose
-        self.log_interval = log_interval
+        
+        # 优化器配置 (可根据 config 调整，这里保持默认 SGD)
+        self.learning_rate = 0.01 
+        self.momentum = 0.9
+        
+        # 初始化 TEE 适配器
+        self.tee_adapter = None
+        if TEEAdapter:
+            self.tee_adapter = TEEAdapter()
+            
+    def receive_model(self, global_state_dict):
+        """接收并加载全局模型参数"""
+        self.model.load_state_dict(global_state_dict)
 
-    def receive_model_and_proj(self, model_params, proj_seed=42):
-        """
-        接收全局模型和投影种子
-        """
-        if self.model is None:
-            self.model = self.model_class().to(DEVICE)
-        
-        # 1. 加载参数到模型 (作为下一轮训练的起点)
-        self.model.load_state_dict(model_params)
-        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
-        
-        # 2. [关键] 保存 w_old (训练前的参数状态)
-        # 我们将其展平并转为 numpy，准备传给 TEE
-        self.w_old_flat = self._flatten_model_params(self.model)
-        
-        # 3. 保存种子
-        self.proj_seed = int(proj_seed)
-        
-        if self.layer_indices is None:
-            self._calculate_layer_indices()
+    def _get_poisoned_dataloader(self):
+        """检查是否有针对当前客户端的投毒任务"""
+        if self.poison_loader and self.poison_loader.is_poisoned_client(self.client_id):
+            if self.verbose:
+                print(f"  [Client {self.client_id}] Loading poisoned data...")
+            return self.poison_loader.get_poisoned_dataloader(self.client_id, self.dataloader)
+        return self.dataloader
 
-    def _flatten_model_params(self, model):
-        """辅助：将模型参数展平为 1D float32 numpy 数组"""
-        # 注意：必须严格按照 parameters() 的顺序
-        all_params = []
+    def local_train(self, epochs=1):
+        """
+        [Phase 2 - Part A] 本地训练 (包含攻击逻辑)
+        """
+        self.model.train()
+        optimizer = optim.SGD(self.model.parameters(), lr=self.learning_rate, momentum=self.momentum)
+        criterion = nn.CrossEntropyLoss()
+        
+        # 获取数据加载器 (可能是被投毒的)
+        train_loader = self._get_poisoned_dataloader()
+        
+        for epoch in range(epochs):
+            for batch_idx, (data, target) in enumerate(train_loader):
+                data, target = data.to(DEVICE), target.to(DEVICE)
+                
+                optimizer.zero_grad()
+                output = self.model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                
+        # 训练结束，self.model 已更新为 w_new
+        # 注意：这里不返回梯度，梯度计算移交给 TEE
+
+    def _flatten_params(self, model):
+        """辅助函数：将模型参数展平为 numpy float32 数组"""
+        params = []
         for param in model.parameters():
-            all_params.append(param.data.view(-1).cpu().numpy())
-        return np.concatenate(all_params).astype(np.float32)
+            params.append(param.data.view(-1).cpu().numpy())
+        return np.concatenate(params).astype(np.float32)
 
-    def _calculate_layer_indices(self):
-        """辅助：计算每层参数的 (start, length)"""
-        self.layer_indices = {}
-        current_idx = 0
-        for name, param in self.model.named_parameters():
-            length = param.numel()
-            self.layer_indices[name] = (current_idx, length)
-            current_idx += length
+    def tee_step1_prepare(self, w_old_flat, proj_seed, target_layers_config=None):
+        """
+        [Phase 2 - Part B] TEE 准备阶段:
+        1. 计算梯度 (w_new - w_old)
+        2. 生成投影 (Projection)
+        3. 锁定梯度状态 (Stateful Lock)
+        
+        Args:
+            w_old_flat: 上一轮的全局模型 (numpy array)
+            proj_seed: 投影矩阵种子
+            target_layers_config: (未使用，保留接口兼容性)
+        Returns:
+            feature_dict: 包含投影信息的字典 {'full': proj_vec}
+        """
+        if self.tee_adapter is None:
+            raise RuntimeError("TEE Adapter not initialized")
 
-    def local_train(self):
-        """本地训练 (REE GPU 加速)"""
-        if self.verbose:
-            print(f"  > [Client {self.client_id}] Start Local Training...")
-
-        # 注意：这里我们不再需要在 Python 侧计算 grad_flat，因为 TEE 会自己算
-        # 但为了兼容 poison_loader 的攻击逻辑，我们保留它
-        trained_params, grad_flat = self.poison_loader.execute_attack(
-            self.model, 
-            self.dataloader, 
-            self.model_class, 
-            DEVICE, 
-            self.optimizer,
-            verbose=self.verbose,
-            uid=self.client_id,
-            log_interval=self.log_interval
+        # 1. 获取 w_new
+        w_new_flat = self._flatten_params(self.model)
+        
+        # 确保 w_old 存在
+        if w_old_flat is None:
+            w_old_flat = np.zeros_like(w_new_flat)
+            
+        # 2. 调用 TEE (ecall_prepare_gradient)
+        # TEE 内部会计算 diff, 存入 Buffer, 并返回投影
+        # 注意：这里我们假设 TEE 返回的是 full projection。
+        # 如果需要分层投影 (Layer-wise)，TEE 接口需要相应调整。
+        # 为简化对接，目前假设 TEE 返回整体投影。
+        
+        projection = self.tee_adapter.prepare_gradient(
+            self.client_id,
+            proj_seed,
+            w_new_flat,
+            w_old_flat
         )
-        return grad_flat
+        
+        # 构造符合 Server 防御接口的格式
+        # Server 期望: {'full': np.array(...), 'layers': {...}}
+        # 目前 TEE 只实现了 full projection
+        feature_dict = {
+            'full': projection,
+            'layers': {} # 如果需要分层防御，需扩展 TEE 接口
+        }
+        
+        return feature_dict, len(self.dataloader.dataset)
 
-    def generate_gradient_projection(self, target_layers=None):
+    def tee_step2_upload(self, weight, seed_mask_root, seed_global_0, n_ratio):
         """
-        [修改] 调用 TEE 进行梯度计算和投影
+        [Phase 4] TEE 上传阶段:
+        1. 传入权重 k_i
+        2. TEE 使用锁定的梯度计算 C_i = k_i * G + Masks
+        3. 销毁梯度状态
+        
+        Returns:
+            encrypted_gradient: int64 numpy array
         """
-        if self.w_old_flat is None:
-            raise ValueError("Initial model state not set! Call receive_model_and_proj first.")
-        
-        # 1. 准备 w_new (训练后的参数)
-        w_new_flat = self._flatten_model_params(self.model)
-        
-        projections = {}
-        
-        # 2. 计算区间 (Ranges)
-        # TEE 需要知道我们要处理哪些部分：全量还是分层
-        
-        # A. 全量投影 (Full)
-        # Range: [0, total_len]
-        # 注意：这里我们不再在 Python 里算，而是直接让 TEE 算
-        proj_full = self.tee_adapter.secure_project(
-            seed=self.proj_seed,
-            w_new_flat=w_new_flat,
-            w_old_flat=self.w_old_flat,
-            ranges=[[0, w_new_flat.size]], # 全量区间
-            output_dim=1024
-        )
-        projections['full'] = proj_full # 这里可能还要加上 poison_loader 的攻击逻辑，暂时忽略
-        
-        # B. 指定层投影 (Layers)
-        if target_layers:
-            projections['layers'] = {}
-            for layer_name in target_layers:
-                if layer_name in self.layer_indices:
-                    start, length = self.layer_indices[layer_name]
-                    
-                    # 调用 TEE 对单层进行投影
-                    proj_layer = self.tee_adapter.secure_project(
-                        seed=self.proj_seed,
-                        w_new_flat=w_new_flat,
-                        w_old_flat=self.w_old_flat,
-                        ranges=[[start, length]], # 单层区间
-                        output_dim=1024
-                    )
-                    projections['layers'][layer_name] = proj_layer
-        
-        return projections
-
-    def prepare_upload_weighted_params(self, weight):
-        """计算加权参数 (REE)"""
-        current_params = self.model.state_dict()
-        weighted_params = {}
-        for key, param in current_params.items():
-            if param.dtype in [torch.float32, torch.float64]:
-                weighted_params[key] = param * weight
-            else:
-                weighted_params[key] = param 
-        return weighted_params
-    
-    def secure_upload_masked(self, weight, seed_r, seed_b):
-        """
-        调用 TEE 生成 C_i = k * w + r + b
-        """
-        if self.w_old_flat is None:
-             # 如果是第一轮，可能没有 old，或者 w_old = initial_params
-             # 这里假设 w_old 已经在 receive_model 时保存了
-             pass
-
-        w_new_flat = self._flatten_model_params(self.model)
-        
-        # 调用 Adapter
-        # ranges 设为 None 表示全量处理，也可以传 self.layer_indices
+        if self.tee_adapter is None:
+            raise RuntimeError("TEE Adapter not initialized")
+            
+        # 调用 TEE (ecall_generate_masked_gradient_dynamic)
+        # 注意：不再传入 w_new/w_old
         encrypted_grad = self.tee_adapter.generate_masked_gradient(
-            seed_r=seed_r,
-            seed_b=seed_b,
-            weight=weight,
-            w_new_flat=w_new_flat,
-            w_old_flat=self.w_old_flat,
-            ranges=None 
+            seed_mask_root,
+            seed_global_0,
+            self.client_id,
+            weight, # k_weight
+            n_ratio # n_ratio
         )
+        
         return encrypted_grad
 
-    # [新增] 执行掉线恢复 (Phase 5)
-    def perform_recovery(self, seed_sss, delta_val, threshold, target_client_id):
+    def tee_step3_get_shares(self, seed_sss, seed_mask_root, target_id, threshold, total_clients):
         """
-        帮助恢复掉线者造成的影响
-        target_client_id: 我们需要计算 P(target_id)
+        [Phase 5] 掉线恢复协助:
+        生成针对 target_id 的密钥分片
         """
-        share = self.tee_adapter.get_recovery_share(
-            seed_sss=seed_sss,
-            secret_val=delta_val, # 这里传入大家都知道的 Delta
-            threshold=threshold,
-            target_x=target_client_id
+        if self.tee_adapter is None:
+            raise RuntimeError("TEE Adapter not initialized")
+            
+        # TEE 返回所有分片，取自己的那一份
+        all_shares = self.tee_adapter.get_vector_shares(
+            seed_sss,
+            seed_mask_root,
+            target_id,
+            threshold,
+            total_clients
         )
-        return share
-
-    def __del__(self):
-        # 析构时尝试关闭 Enclave
-        if hasattr(self, 'tee_adapter'):
-            self.tee_adapter.close()
+        # 返回本客户端持有的那份分片 (index = self.client_id)
+        return all_shares[self.client_id]

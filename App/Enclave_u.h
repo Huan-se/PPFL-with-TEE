@@ -16,6 +16,14 @@
 extern "C" {
 #endif
 
+#ifndef _SharePackage
+#define _SharePackage
+typedef struct SharePackage {
+	double share_alpha;
+	double share_beta;
+} SharePackage;
+#endif
+
 #ifndef OCALL_PRINT_STRING_DEFINED__
 #define OCALL_PRINT_STRING_DEFINED__
 void SGX_UBRIDGE(SGX_NOCONVENTION, ocall_print_string, (const char* str));
@@ -41,9 +49,9 @@ int SGX_UBRIDGE(SGX_CDECL, sgx_thread_setwait_untrusted_events_ocall, (const voi
 int SGX_UBRIDGE(SGX_CDECL, sgx_thread_set_multiple_untrusted_events_ocall, (const void** waiters, size_t total));
 #endif
 
-sgx_status_t ecall_secure_aggregation_phase(sgx_enclave_id_t eid, long int seed, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output, size_t out_len);
-sgx_status_t ecall_generate_masked_gradient(sgx_enclave_id_t eid, long int seed_r, long int seed_b, float weight, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output, size_t out_len);
-sgx_status_t ecall_get_recovery_share(sgx_enclave_id_t eid, long int seed_sss, float secret_val, int threshold, int target_x, float* share_val);
+sgx_status_t ecall_prepare_gradient(sgx_enclave_id_t eid, int client_id, long int proj_seed, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output_proj, size_t out_len);
+sgx_status_t ecall_generate_masked_gradient_dynamic(sgx_enclave_id_t eid, long int seed_mask_root, long int seed_global_0, int client_id, float k_weight, float n_ratio, size_t model_len, int* ranges, size_t ranges_len, long long* output, size_t out_len);
+sgx_status_t ecall_get_vector_shares_dynamic(sgx_enclave_id_t eid, long int seed_sss, long int seed_mask_root, int target_client_id, int threshold, int total_clients, struct SharePackage* output_shares);
 
 #ifdef __cplusplus
 }

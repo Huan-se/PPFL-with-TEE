@@ -15,9 +15,17 @@
 extern "C" {
 #endif
 
-void ecall_secure_aggregation_phase(long int seed, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output, size_t out_len);
-void ecall_generate_masked_gradient(long int seed_r, long int seed_b, float weight, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output, size_t out_len);
-void ecall_get_recovery_share(long int seed_sss, float secret_val, int threshold, int target_x, float* share_val);
+#ifndef _SharePackage
+#define _SharePackage
+typedef struct SharePackage {
+	double share_alpha;
+	double share_beta;
+} SharePackage;
+#endif
+
+void ecall_prepare_gradient(int client_id, long int proj_seed, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output_proj, size_t out_len);
+void ecall_generate_masked_gradient_dynamic(long int seed_mask_root, long int seed_global_0, int client_id, float k_weight, float n_ratio, size_t model_len, int* ranges, size_t ranges_len, long long* output, size_t out_len);
+void ecall_get_vector_shares_dynamic(long int seed_sss, long int seed_mask_root, int target_client_id, int threshold, int total_clients, struct SharePackage* output_shares);
 
 sgx_status_t SGX_CDECL ocall_print_string(const char* str);
 sgx_status_t SGX_CDECL sgx_oc_cpuidex(int cpuinfo[4], int leaf, int subleaf);
