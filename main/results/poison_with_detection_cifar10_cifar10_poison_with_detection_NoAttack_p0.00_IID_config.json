@@ -1,0 +1,87 @@
+{
+    "experiment": {
+        "seed": 42,
+        "save_dir": "results",
+        "thread_count": 20,
+        "use_multiprocessing": true,
+        "device": "cuda",
+        "modes": "poison_with_detection",
+        "verbose": true,
+        "log_interval": 100
+    },
+    "federated": {
+        "comm_rounds": 10,
+        "total_clients": 20,
+        "active_clients": 20,
+        "local_epochs": 3,
+        "batch_size": 64,
+        "lr": 0.005
+    },
+    "data": {
+        "dataset": "cifar10",
+        "model": "cifar10",
+        "if_noniid": false,
+        "alpha": 0.5
+    },
+    "defense": {
+        "method": "layers_proj_detect",
+        "projection_dim": 1024,
+        "target_layers": [
+            "fc.weight"
+        ]
+    },
+    "params": {
+        "clustering_method": "kmeans",
+        "dist_threshold_multiplier": 3.5,
+        "score_decay_rate": 2.0,
+        "l2_threshold_multiplier": 4,
+        "var_threshold_multiplier": 4,
+        "base_good_score": 1.0,
+        "suspect_score": 1.0,
+        "max_bonus": 100.0,
+        "strike_threshold": 33,
+        "dbscan_eps": 0.5,
+        "dbscan_min_samples": 2
+    },
+    "attack": {
+        "poison_ratio": 0.2,
+        "active_attacks": [
+            "backdoor"
+        ],
+        "params": {
+            "random_poison": {
+                "noise_std": 0.5
+            },
+            "label_flip": {
+                "source_class": 5,
+                "target_class": 7,
+                "scale_update": true,
+                "scale_factor": 2.0
+            },
+            "backdoor": {
+                "backdoor_ratio": 0.1,
+                "backdoor_target": 0,
+                "trigger_size": 3,
+                "scale_update": true,
+                "scale_factor": 3.0
+            },
+            "model_compress": {
+                "compress_ratio": 0.95
+            },
+            "gradient_amplify": {
+                "amplify_factor": 5.0
+            },
+            "gradient_inversion": {
+                "inversion_strength": 1.0
+            },
+            "feature_poison": {
+                "poison_strength": 0.3,
+                "perturb_dim": 100
+            },
+            "batch_poison": {
+                "poison_ratio": 0.2,
+                "batch_noise_std": 0.1
+            }
+        }
+    }
+}
