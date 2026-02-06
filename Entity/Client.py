@@ -39,7 +39,9 @@ class Client(object):
         if self.poison_loader and hasattr(self.poison_loader, 'is_poisoned_client'):
             if self.poison_loader.is_poisoned_client(self.client_id):
                 if self.verbose:
-                    print(f"  [Client {self.client_id}] Loading poisoned data...")
+                    # 为了防止多线程刷屏，这里可以注释掉，或者保留
+                    # print(f"  [Client {self.client_id}] Loading poisoned data...")
+                    pass
                 # 适配 Monkey Patched 的 get_poisoned_dataloader
                 return self.poison_loader.get_poisoned_dataloader(self.client_id, self.dataloader)
         return self.dataloader
@@ -53,6 +55,10 @@ class Client(object):
         train_loader = self._get_poisoned_dataloader()
         
         for epoch in range(epochs):
+            total_loss = 0.0
+            correct = 0
+            total = 0
+            
             for batch_idx, (data, target) in enumerate(train_loader):
                 data, target = data.to(DEVICE), target.to(DEVICE)
                 
@@ -61,6 +67,18 @@ class Client(object):
                 loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
+                
+                # 统计
+                total_loss += loss.item()
+                _, predicted = output.max(1)
+                total += target.size(0)
+                correct += predicted.eq(target).sum().item()
+
+            # [新增] 训练日志输出
+            if self.verbose:
+                avg_loss = total_loss / len(train_loader)
+                acc = 100. * correct / total
+                print(f"  [Client {self.client_id}] Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
 
     def _flatten_params(self, model):
         params = []
@@ -93,7 +111,6 @@ class Client(object):
         
         return feature_dict, len(self.dataloader.dataset)
 
-    # [修正] 更新为 V2 接口，接收 active_ids 而不是 n_ratio
     def tee_step2_upload(self, weight, active_ids, seed_mask_root, seed_global_0):
         """[Phase 4] TEE 上传阶段 - 生成加密梯度"""
         if self.tee_adapter is None:
@@ -103,31 +120,27 @@ class Client(object):
         w_len = sum(p.numel() for p in self.model.parameters())
 
         # 调用 TEE generate_masked_gradient
-        # 对应 tee_adapter.py 中的 generate_masked_gradient(seed_mask, seed_g0, cid, active_ids, k_weight, ...)
         encrypted_grad = self.tee_adapter.generate_masked_gradient(
             seed_mask=seed_mask_root,
             seed_g0=seed_global_0,
             cid=self.client_id,
-            active_ids=active_ids,  # [变更] 传入活跃 ID 列表，TEE 内部计算互掩码系数
-            k_weight=weight,        # [变更] 传入聚合权重
+            active_ids=active_ids, 
+            k_weight=weight,        
             model_len=w_len
         )
         
         return encrypted_grad
 
-    # [修正] 更新为 V2 接口，接收 u1_ids 和 u2_ids
     def tee_step3_get_shares(self, seed_sss, seed_mask_root, u1_ids, u2_ids, threshold):
         """[Phase 5] 掉线恢复 - 生成秘密分片"""
         if self.tee_adapter is None:
             raise RuntimeError("TEE Adapter not initialized")
             
-        # 调用 TEE get_vector_shares
-        # 对应 tee_adapter.py 中的 get_vector_shares(seed_sss, seed_mask, u1_ids, u2_ids, my_cid, threshold)
         my_share_vector = self.tee_adapter.get_vector_shares(
             seed_sss=seed_sss,
             seed_mask=seed_mask_root,
-            u1_ids=u1_ids,  # Phase 4 参与者 (用于重算 Inv)
-            u2_ids=u2_ids,  # Phase 5 存活者 (用于计算 Delta)
+            u1_ids=u1_ids, 
+            u2_ids=u2_ids,
             my_cid=self.client_id,
             threshold=threshold
         )
