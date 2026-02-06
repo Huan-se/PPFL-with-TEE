@@ -9,39 +9,49 @@ extern "C" {
 int tee_init(const char* enclave_filename);
 void tee_destroy();
 
-// 1. 投影接口
-int tee_secure_aggregation(
-    long seed, 
+void tee_prepare_gradient(
+    int client_id,
+    long proj_seed, 
     float* w_new, 
     float* w_old, 
     int model_len, 
     int* ranges, 
     int ranges_len, 
-    float* output, 
+    float* output_proj, 
     int out_len
 );
 
-// 2. 双掩码梯度接口
-int tee_generate_masked_gradient(
-    long seed_r,
-    long seed_b,
-    float weight,
-    float* w_new,
-    float* w_old,
-    int model_len,
-    int* ranges,
-    int ranges_len,
-    float* output,
+void tee_generate_masked_gradient_dynamic(
+    long seed_mask_root, 
+    long seed_global_0, 
+    int client_id, 
+    int* active_ids, 
+    int active_len, 
+    float k_weight, 
+    int model_len, 
+    int* ranges, 
+    int ranges_len, 
+    long long* output, 
     int out_len
 );
 
-// 3. 恢复接口
-int tee_get_recovery_share(
-    long seed_sss,
-    float secret_val,
-    int threshold,
-    int target_x,
-    float* share_val
+void tee_get_vector_shares_dynamic(
+    long seed_sss, 
+    long seed_mask_root, 
+    int* u1_ids, 
+    int u1_len, 
+    int* u2_ids, 
+    int u2_len, 
+    int my_client_id, 
+    int threshold, 
+    long long* output_vector, 
+    int out_max_len
+);
+
+void tee_generate_noise_from_seed(
+    long seed, 
+    int len, 
+    long long* output
 );
 
 #if defined(__cplusplus)

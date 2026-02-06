@@ -23,13 +23,13 @@ from _utils_.poison_loader import PoisonLoader
 from model.Cifar10Net import CIFAR10Net
 from model.Lenet5 import LeNet5
 from _utils_.save_config import save_result_with_config
+# [删除] 不再需要在这里引用 TEEAdapter，Server 和 Client 内部会处理
 
 # ==========================================
 # 全局常量
 # ==========================================
 MOD = 9223372036854775783
 SCALE = 10000.0
-SIMULATED_DROP_RATE = 0.0
 
 def load_config(path):
     with open(path, 'r') as f:
@@ -43,43 +43,6 @@ def flatten_params(model):
     for param in model.parameters():
         params.append(param.data.view(-1).cpu().numpy())
     return np.concatenate(params).astype(np.float32)
-
-def unflatten_params(flat_params, reference_model):
-    updated_state_dict = {}
-    current_idx = 0
-    for name, param in reference_model.named_parameters():
-        numel = param.numel()
-        shape = param.shape
-        flat_slice = flat_params[current_idx : current_idx + numel]
-        tensor_slice = torch.from_numpy(flat_slice).view(shape).to(param.device)
-        updated_state_dict[name] = tensor_slice
-        current_idx += numel
-    return updated_state_dict
-
-def generate_noise_vector(seed, shape):
-    rng = np.random.Generator(np.random.MT19937(seed))
-    flat_len = np.prod(shape)
-    raw_u32 = rng.integers(0, 4294967296, size=flat_len * 2, dtype=np.uint32)
-    pairs = raw_u32.reshape(-1, 2)
-    low = pairs[:, 0].astype(np.uint64)
-    high = pairs[:, 1].astype(np.uint64)
-    raw_u64 = (high << 32) | low
-    return (raw_u64 % MOD).astype(np.int64).reshape(shape)
-
-def lagrange_interpolate(shares, x=0):
-    secret = 0
-    for i, (xi, yi) in enumerate(shares):
-        num = 1
-        den = 1
-        for j, (xj, yj) in enumerate(shares):
-            if i == j: continue
-            num = (num * (x - xj)) % MOD
-            den = (den * (xi - xj)) % MOD
-        if den == 0: continue
-        inv = pow(int(den), int(MOD) - 2, int(MOD))
-        term = (yi * num * inv) % MOD
-        secret = (secret + term) % MOD
-    return secret
 
 # ==========================================
 # 辅助类：投毒数据加载器包装器
@@ -99,7 +62,7 @@ class PoisonedDataLoaderWrapper:
         return len(self.dataloader)
 
 # ==========================================
-# 并行任务 (Thread Safe)
+# 并行任务 (Thread Safe) - 仅用于 Phase 2 训练
 # ==========================================
 
 def task_tee_step1_train_prepare(client, global_params_cpu, w_old_flat, proj_seed, target_layers, device_str):
@@ -111,16 +74,20 @@ def task_tee_step1_train_prepare(client, global_params_cpu, w_old_flat, proj_see
             if next(client.model.parameters()).device != device:
                  client.model = client.model.to(device)
         
+        # 加载全局参数
         global_params_device = {k: v.to(device) for k, v in global_params_cpu.items()}
         if hasattr(client, 'receive_model'):
             client.receive_model(global_params_device)
         else:
             client.model.load_state_dict(global_params_device)
             
+        # 本地训练
         client.local_train()
         
+        # TEE 准备 (计算梯度、投影)
         feature_dict, data_size = client.tee_step1_prepare(w_old_flat, proj_seed, target_layers)
         
+        # 转回 CPU 以便序列化
         feature_dict_cpu = {'full': torch.from_numpy(feature_dict['full']), 'layers': {}}
         if 'layers' in feature_dict:
             for k, v in feature_dict['layers'].items():
@@ -131,27 +98,6 @@ def task_tee_step1_train_prepare(client, global_params_cpu, w_old_flat, proj_see
         import traceback
         traceback.print_exc()
         return client.client_id, None, 0, str(e)
-
-def task_tee_step2_upload(client, weight, seed_mask_root, seed_global_0, n_ratio):
-    try:
-        if random.random() < SIMULATED_DROP_RATE:
-            return client.client_id, None, "Dropped"
-        
-        encrypted_grad = client.tee_step2_upload(weight, seed_mask_root, seed_global_0, n_ratio)
-        return client.client_id, encrypted_grad, None
-    except Exception as e:
-        return client.client_id, None, str(e)
-
-def task_tee_step3_shares(client, seed_sss, seed_mask_root, target_id, threshold, total_clients):
-    try:
-        # share 是字典 {'alpha': ..., 'beta': ...}
-        share = client.tee_step3_get_shares(seed_sss, seed_mask_root, target_id, threshold, total_clients)
-        # [Fix] 直接返回字典，不要使用 share.alpha
-        return client.client_id, share
-    except Exception as e:
-        # [Fix] 打印错误详情，而不是静默失败
-        print(f"  [Error] Share recovery failed for client {client.client_id}: {e}")
-        return client.client_id, None
 
 # ==========================================
 # 主流程
@@ -175,7 +121,7 @@ def run_single_mode(config, mode_name, mode_config):
     worker_count = exp_conf.get('thread_count', 4)
     
     if use_multiprocessing:
-        print(f"  [System] Parallel Mode Enabled: Using {worker_count} Threads.")
+        print(f"  [System] Parallel Mode Enabled: Using {worker_count} Threads (Training Phase).")
         ExecutorClass = ThreadPoolExecutor
     else:
         print("  [System] Serial Mode.")
@@ -229,6 +175,7 @@ def run_single_mode(config, mode_name, mode_config):
     log_name = f"{mode_name}_{data_conf['dataset']}_{data_conf['model']}_{detection_method}_{atk_conf['active_attacks'] or 'NoAttack'}_p{atk_conf['poison_ratio']:.2f}_{'NonIID' if data_conf['if_noniid'] else 'IID'}"
     log_path = os.path.join(current_dir, "results", f"{log_name}_detection_log.csv")
     
+    # 初始化 Server
     server = Server(
         model_class=ModelClass,
         test_dataloader=test_loader,
@@ -241,20 +188,11 @@ def run_single_mode(config, mode_name, mode_config):
         malicious_clients=malicious_clients_list
     )
     
-    # Global Enclave Init
-    from _utils_.tee_adapter import TEEAdapter
-    try:
-        dummy_adapter = TEEAdapter()
-        dummy_adapter.initialize_enclave()
-        print("  [TEE] Enclave successfully initialized (Global).")
-    except Exception as e:
-        print(f"  [TEE] Enclave init warning: {e}")
-
+    # 初始化 Clients
+    # TEE 初始化会自动处理，这里只需创建对象
     clients = []
     for i in range(fed_conf['total_clients']):
         c = Client(i, train_loaders[i], ModelClass, poison_loader)
-        c.tee_adapter = TEEAdapter() 
-        c.tee_adapter.initialized = True 
         clients.append(c)
         
     current_w_old_flat = flatten_params(server.global_model)
@@ -269,6 +207,7 @@ def run_single_mode(config, mode_name, mode_config):
         print(f"\n>>> Round {r}/{total_rounds} Start...")
         start_time = time.time()
         
+        # 1. 随机选择本轮客户端
         active_ids = random.sample(range(fed_conf['total_clients']), fed_conf['active_clients'])
         active_ids.sort()
         
@@ -276,7 +215,8 @@ def run_single_mode(config, mode_name, mode_config):
         global_params_cpu = {k: v.cpu() for k, v in global_params.items()}
         current_proj_seed = int(seed + r)
         
-        # --- Phase 2: Train & Prepare ---
+        # --- Phase 2: Train & Prepare (Parallelizable) ---
+        # 本地训练和计算摘要可以在 CPU/GPU 并行
         client_features_dict_list = {}
         client_data_sizes = {}
         
@@ -304,100 +244,37 @@ def run_single_mode(config, mode_name, mode_config):
                     client_features_dict_list[cid] = feats
                     client_data_sizes[cid] = dsize
 
-        # --- Phase 3: Defense ---
+        # --- Phase 3: Defense (Compute Weights) ---
         valid_ids = [cid for cid in active_ids if cid in client_features_dict_list]
         feature_list = [client_features_dict_list[cid] for cid in valid_ids]
         size_list = [client_data_sizes[cid] for cid in valid_ids]
         
+        # 计算权重 (包含 MESAS 检测逻辑)
         weights_map = server.calculate_weights(valid_ids, feature_list, size_list, current_round=r)
+        
+        # 筛选出权重 > 0 的客户端 (即未被踢出的)
         accepted_ids = [cid for cid, w in weights_map.items() if w > 1e-6]
+        accepted_ids.sort()
         
-        kicked = len(valid_ids) - len(accepted_ids)
-        if kicked > 0: print(f"  [Defence] Kicked {kicked} clients.")
-        if not accepted_ids: continue
+        kicked_count = len(valid_ids) - len(accepted_ids)
+        if kicked_count > 0: 
+            print(f"  [Defence] Kicked {kicked_count} clients.")
+        
+        if not accepted_ids: 
+            print("  [Warning] No accepted clients this round. Skipping aggregation.")
+            continue
 
-        # --- Phase 4: Secure Upload ---
-        SEED_mask_root = random.randint(0, 2**30)
-        SEED_sss = random.randint(0, 2**30)
-        Seed_Global_0 = int(hash(str(r)) & 0x7FFFFFFF)
+        # --- Phase 4 & 5: Secure Aggregation (Delegated to Server) ---
+        # 将所有复杂的密钥交换、上传、恢复逻辑委托给 Server
+        # 注意: secure_aggregation 内部是串行调用 TEE 接口的，这通常更安全，防止 SGX 资源竞争
         
-        uploaded_c_i = {}
-        online_clients = []
-        
-        if ExecutorClass:
-            with ExecutorClass(max_workers=worker_count) as executor:
-                futures = {}
-                for cid in accepted_ids:
-                    w = weights_map[cid]
-                    futures[executor.submit(
-                        task_tee_step2_upload, clients[cid], w, SEED_mask_root, Seed_Global_0, w
-                    )] = cid
-                for f in as_completed(futures):
-                    cid, c_i, err = f.result()
-                    if c_i is not None:
-                        uploaded_c_i[cid] = c_i
-                        online_clients.append(cid)
-                    else:
-                        if err != "Dropped": print(f"  [Error] Upload {cid}: {err}")
-        else:
-            for cid in accepted_ids:
-                w = weights_map[cid]
-                _, c_i, err = task_tee_step2_upload(clients[cid], w, SEED_mask_root, Seed_Global_0, w)
-                if c_i is not None:
-                    uploaded_c_i[cid] = c_i
-                    online_clients.append(cid)
+        # 传入所有客户端对象 (Server 会根据 accepted_ids 自动筛选)
+        server.secure_aggregation(clients, accepted_ids, round_num=r)
 
-        # --- Phase 5: Aggregation ---
-        if not uploaded_c_i: continue
-        
-        sample_shape = next(iter(uploaded_c_i.values())).shape
-        agg_accumulator = np.zeros(sample_shape, dtype=np.int64)
-        for cid in online_clients:
-            agg_accumulator = (agg_accumulator + uploaded_c_i[cid]) % MOD
-            
-        threshold = 3
-        if len(online_clients) < threshold: continue
-        helpers = online_clients[:threshold]
-        
-        def fetch_share(helper_id, target_id):
-            _, share_struct = task_tee_step3_shares(clients[helper_id], SEED_sss, SEED_mask_root, target_id, threshold, fed_conf['total_clients'])
-            if share_struct is None: return 0 # Fallback safety
-            if target_id == 0: return share_struct['alpha']
-            return share_struct['beta']
-
-        pts_alpha = [(h+1, fetch_share(h, 0)) for h in helpers]
-        rec_alpha = lagrange_interpolate(pts_alpha)
-        
-        rec_betas = {}
-        for u in online_clients:
-            pts_beta = [(h+1, fetch_share(h, u)) for h in helpers]
-            rec_betas[u] = lagrange_interpolate(pts_beta)
-
-        real_global_seed = (Seed_Global_0 + int(rec_alpha)) & 0x7FFFFFFF
-        vec_g = generate_noise_vector(real_global_seed, sample_shape)
-        
-        sum_weights = sum([weights_map[cid] for cid in online_clients])
-        term_g = (vec_g * int(sum_weights * SCALE)) // int(SCALE)
-        agg_accumulator = (agg_accumulator - term_g) % MOD
-        
-        for cid in online_clients:
-            beta_seed = int(rec_betas[cid]) & 0x7FFFFFFF
-            vec_b = generate_noise_vector(beta_seed, sample_shape)
-            agg_accumulator = (agg_accumulator - vec_b) % MOD
-
-        agg_float = agg_accumulator.astype(np.float32)
-        agg_float[agg_float > (MOD // 2)] -= MOD
-        agg_float /= SCALE
-        
-        update_dict = unflatten_params(agg_float, server.global_model)
-        server_state = server.global_model.state_dict()
-        for k in server_state.keys():
-            if k in update_dict:
-                server_state[k] += update_dict[k]
-        
-        server.update_global_model_with_state_dict(server_state)
+        # 更新历史记录
         current_w_old_flat = flatten_params(server.global_model)
 
+        # 评估
         acc, loss = server.evaluate()
         acc_history.append(acc)
         print(f"  [Round {r}] Global Acc: {acc:.2f}%, Loss: {loss:.4f} | Time: {time.time()-start_time:.1f}s")
