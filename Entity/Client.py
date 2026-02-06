@@ -93,38 +93,42 @@ class Client(object):
         
         return feature_dict, len(self.dataloader.dataset)
 
-    def tee_step2_upload(self, weight, seed_mask_root, seed_global_0, n_ratio):
-        """[Phase 4] TEE 上传阶段"""
+    # [修正] 更新为 V2 接口，接收 active_ids 而不是 n_ratio
+    def tee_step2_upload(self, weight, active_ids, seed_mask_root, seed_global_0):
+        """[Phase 4] TEE 上传阶段 - 生成加密梯度"""
         if self.tee_adapter is None:
             raise RuntimeError("TEE Adapter not initialized")
             
-        # [关键修复] 计算模型参数总长度
+        # 计算模型参数总长度
         w_len = sum(p.numel() for p in self.model.parameters())
 
         # 调用 TEE generate_masked_gradient
-        # 必须传入 model_len，否则 adapter 默认使用 0，导致返回空数组
+        # 对应 tee_adapter.py 中的 generate_masked_gradient(seed_mask, seed_g0, cid, active_ids, k_weight, ...)
         encrypted_grad = self.tee_adapter.generate_masked_gradient(
-            seed_mask_root,
-            seed_global_0,
-            self.client_id,
-            weight, 
-            n_ratio,
-            model_len=w_len # <--- 必须传入
+            seed_mask=seed_mask_root,
+            seed_g0=seed_global_0,
+            cid=self.client_id,
+            active_ids=active_ids,  # [变更] 传入活跃 ID 列表，TEE 内部计算互掩码系数
+            k_weight=weight,        # [变更] 传入聚合权重
+            model_len=w_len
         )
         
         return encrypted_grad
 
-    def tee_step3_get_shares(self, seed_sss, seed_mask_root, target_id, threshold, total_clients):
-        """[Phase 5] 掉线恢复协助"""
+    # [修正] 更新为 V2 接口，接收 u1_ids 和 u2_ids
+    def tee_step3_get_shares(self, seed_sss, seed_mask_root, u1_ids, u2_ids, threshold):
+        """[Phase 5] 掉线恢复 - 生成秘密分片"""
         if self.tee_adapter is None:
             raise RuntimeError("TEE Adapter not initialized")
             
-        all_shares = self.tee_adapter.get_vector_shares(
-            seed_sss,
-            seed_mask_root,
-            target_id,
-            threshold,
-            total_clients
+        # 调用 TEE get_vector_shares
+        # 对应 tee_adapter.py 中的 get_vector_shares(seed_sss, seed_mask, u1_ids, u2_ids, my_cid, threshold)
+        my_share_vector = self.tee_adapter.get_vector_shares(
+            seed_sss=seed_sss,
+            seed_mask=seed_mask_root,
+            u1_ids=u1_ids,  # Phase 4 参与者 (用于重算 Inv)
+            u2_ids=u2_ids,  # Phase 5 存活者 (用于计算 Delta)
+            my_cid=self.client_id,
+            threshold=threshold
         )
-        # 返回本客户端持有的那份分片
-        return all_shares[self.client_id]
+        return my_share_vector
