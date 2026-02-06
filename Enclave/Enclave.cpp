@@ -1,4 +1,4 @@
-/* Enclave/Enclave.cpp - Final Version */
+/* Enclave/Enclave.cpp */
 #include "Enclave_t.h"
 #include "sgx_trts.h"
 #include "sgx_tcrypto.h"
@@ -77,34 +77,49 @@ void ecall_prepare_gradient(
     float* w_new, float* w_old, size_t model_len, 
     int* ranges, size_t ranges_len, float* output_proj, size_t out_len
 ) {
-    std::vector<float> full_gradient(model_len);
-    for(size_t i = 0; i < model_len; ++i) full_gradient[i] = w_new[i] - w_old[i];
-    
-    {
-        std::lock_guard<std::mutex> lock(g_map_mutex);
-        g_gradient_buffer[client_id] = full_gradient;
-    }
-
-    DeterministicRandom rng(proj_seed);
-    Eigen::VectorXf proj_chunk(CHUNK_SIZE);
-    
-    for (size_t k = 0; k < out_len; ++k) {
-        float dot_product = 0.0f;
-        for (size_t r = 0; r < ranges_len; r += 2) {
-            int start_idx = ranges[r];
-            int block_len = ranges[r+1];
-            if (start_idx < 0 || start_idx + block_len > (int)model_len) continue;
-            int offset = 0;
-            while (offset < block_len) {
-                int curr = std::min((int)CHUNK_SIZE, block_len - offset);
-                for(int i=0; i<curr; ++i) proj_chunk[i] = rng.next_normal();
-                int idx = start_idx + offset;
-                Eigen::Map<Eigen::VectorXf> grad_segment(full_gradient.data() + idx, curr);
-                dot_product += grad_segment.dot(proj_chunk.head(curr));
-                offset += curr;
-            }
+    try {
+        // 1. Calculate Gradient
+        std::vector<float> full_gradient;
+        full_gradient.reserve(model_len);
+        for(size_t i = 0; i < model_len; ++i) {
+            full_gradient.push_back(w_new[i] - w_old[i]);
         }
-        output_proj[k] = dot_product;
+        
+        // 2. Lock & Store
+        {
+            std::lock_guard<std::mutex> lock(g_map_mutex);
+            g_gradient_buffer[client_id] = full_gradient;
+        }
+
+        // 3. Project
+        DeterministicRandom rng(proj_seed);
+        Eigen::VectorXf proj_chunk(CHUNK_SIZE);
+        
+        for (size_t k = 0; k < out_len; ++k) {
+            float dot_product = 0.0f;
+            for (size_t r = 0; r < ranges_len; r += 2) {
+                int start_idx = ranges[r];
+                int block_len = ranges[r+1];
+                if (start_idx < 0 || start_idx + block_len > (int)model_len) continue;
+                
+                int offset = 0;
+                while (offset < block_len) {
+                    int curr = std::min((int)CHUNK_SIZE, block_len - offset);
+                    for(int i=0; i<curr; ++i) proj_chunk[i] = rng.next_normal();
+                    
+                    int idx = start_idx + offset;
+                    // Safe Check
+                    if (idx + curr > (int)full_gradient.size()) break;
+                    
+                    Eigen::Map<Eigen::VectorXf> grad_segment(full_gradient.data() + idx, curr);
+                    dot_product += grad_segment.dot(proj_chunk.head(curr));
+                    offset += curr;
+                }
+            }
+            output_proj[k] = dot_product;
+        }
+    } catch (...) {
+        printf("[Enclave] Exception in prepare_gradient!\n");
     }
 }
 
@@ -114,47 +129,56 @@ void ecall_generate_masked_gradient_dynamic(
     size_t model_len, int* ranges, size_t ranges_len, long long* output, size_t out_len
 ) {
     std::vector<float> grad;
-    {
-        std::lock_guard<std::mutex> lock(g_map_mutex);
-        auto it = g_gradient_buffer.find(client_id);
-        if (it == g_gradient_buffer.end()) {
-            for(size_t i=0; i<out_len; ++i) output[i] = 0;
-            return;
-        }
-        grad = it->second; 
-        g_gradient_buffer.erase(it); // Destroy state immediately
-    }
-    
-    if (grad.size() != model_len) return;
-
-    long seed_alpha = CryptoUtils::derive_seed(seed_mask_root, "alpha", 0);
-    long seed_beta  = CryptoUtils::derive_seed(seed_mask_root, "beta", client_id);
-    long seed_global_final = (seed_global_0 + seed_alpha) & 0x7FFFFFFF;
-
-    DeterministicRandom rng_global(seed_global_final);
-    DeterministicRandom rng_beta(seed_beta);
-
-    size_t current_out_idx = 0;
-    for (size_t r = 0; r < ranges_len; r += 2) {
-        int start_idx = ranges[r];
-        int block_len = ranges[r+1];
-        if (start_idx < 0 || start_idx + block_len > (int)model_len) continue;
-        int offset = 0;
-        while (offset < block_len) {
-            int curr = std::min((int)CHUNK_SIZE, block_len - offset);
-            int idx = start_idx + offset;
-            for (int i = 0; i < curr; ++i) {
-                float g_val = grad[idx+i];
-                long long term_grad = (long long)(g_val * k_weight * SCALE);
-                long long vec_g = rng_global.next_mask_mod();
-                long long term_g = (long long)(vec_g * n_ratio);
-                long long vec_b = rng_beta.next_mask_mod();
-                unsigned __int128 sum = (unsigned __int128)term_grad + term_g + vec_b;
-                output[current_out_idx + i] = (long long)(sum % MOD);
+    try {
+        {
+            std::lock_guard<std::mutex> lock(g_map_mutex);
+            auto it = g_gradient_buffer.find(client_id);
+            if (it == g_gradient_buffer.end()) {
+                // Client data not found - fill zero and return
+                for(size_t i=0; i<out_len; ++i) output[i] = 0;
+                return;
             }
-            current_out_idx += curr;
-            offset += curr;
+            grad = it->second; 
+            g_gradient_buffer.erase(it); // Destroy state
         }
+        
+        if (grad.size() != model_len) {
+             for(size_t i=0; i<out_len; ++i) output[i] = 0;
+             return;
+        }
+
+        long seed_alpha = CryptoUtils::derive_seed(seed_mask_root, "alpha", 0);
+        long seed_beta  = CryptoUtils::derive_seed(seed_mask_root, "beta", client_id);
+        long seed_global_final = (seed_global_0 + seed_alpha) & 0x7FFFFFFF;
+
+        DeterministicRandom rng_global(seed_global_final);
+        DeterministicRandom rng_beta(seed_beta);
+
+        size_t current_out_idx = 0;
+        for (size_t r = 0; r < ranges_len; r += 2) {
+            int start_idx = ranges[r];
+            int block_len = ranges[r+1];
+            if (start_idx < 0 || start_idx + block_len > (int)model_len) continue;
+            int offset = 0;
+            while (offset < block_len) {
+                int curr = std::min((int)CHUNK_SIZE, block_len - offset);
+                int idx = start_idx + offset;
+                for (int i = 0; i < curr; ++i) {
+                    float g_val = grad[idx+i];
+                    long long term_grad = (long long)(g_val * k_weight * SCALE);
+                    long long vec_g = rng_global.next_mask_mod();
+                    long long term_g = (long long)(vec_g * n_ratio);
+                    long long vec_b = rng_beta.next_mask_mod();
+                    unsigned __int128 sum = (unsigned __int128)term_grad + term_g + vec_b;
+                    output[current_out_idx + i] = (long long)(sum % MOD);
+                }
+                current_out_idx += curr;
+                offset += curr;
+            }
+        }
+    } catch (...) {
+        printf("[Enclave] Exception in generate_masked!\n");
+        for(size_t i=0; i<out_len; ++i) output[i] = 0;
     }
 }
 

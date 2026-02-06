@@ -85,15 +85,13 @@ def lagrange_interpolate(shares, x=0):
 # 辅助类：投毒数据加载器包装器
 # ==========================================
 class PoisonedDataLoaderWrapper:
-    """包装 DataLoader 以在迭代时动态应用投毒"""
     def __init__(self, dataloader, poison_loader):
         self.dataloader = dataloader
         self.poison_loader = poison_loader
-        self.dataset = dataloader.dataset # 兼容性
+        self.dataset = dataloader.dataset
 
     def __iter__(self):
         for data, target in self.dataloader:
-            # 动态应用数据投毒
             data_p, target_p = self.poison_loader.apply_data_poison(data, target)
             yield data_p, target_p
 
@@ -113,17 +111,14 @@ def task_tee_step1_train_prepare(client, global_params_cpu, w_old_flat, proj_see
             if next(client.model.parameters()).device != device:
                  client.model = client.model.to(device)
         
-        # Load params
         global_params_device = {k: v.to(device) for k, v in global_params_cpu.items()}
         if hasattr(client, 'receive_model'):
             client.receive_model(global_params_device)
         else:
             client.model.load_state_dict(global_params_device)
             
-        # Local Train
         client.local_train()
         
-        # TEE Step 1
         feature_dict, data_size = client.tee_step1_prepare(w_old_flat, proj_seed, target_layers)
         
         feature_dict_cpu = {'full': torch.from_numpy(feature_dict['full']), 'layers': {}}
@@ -149,9 +144,13 @@ def task_tee_step2_upload(client, weight, seed_mask_root, seed_global_0, n_ratio
 
 def task_tee_step3_shares(client, seed_sss, seed_mask_root, target_id, threshold, total_clients):
     try:
+        # share 是字典 {'alpha': ..., 'beta': ...}
         share = client.tee_step3_get_shares(seed_sss, seed_mask_root, target_id, threshold, total_clients)
-        return client.client_id, {'alpha': share.share_alpha, 'beta': share.share_beta}
-    except Exception:
+        # [Fix] 直接返回字典，不要使用 share.alpha
+        return client.client_id, share
+    except Exception as e:
+        # [Fix] 打印错误详情，而不是静默失败
+        print(f"  [Error] Share recovery failed for client {client.client_id}: {e}")
         return client.client_id, None
 
 # ==========================================
@@ -195,7 +194,7 @@ def run_single_mode(config, mode_name, mode_config):
     elif data_conf['model'] == 'mnist': ModelClass = LeNet5
     else: raise ValueError(f"Unknown model: {data_conf['model']}")
         
-    # [修正] 投毒模块初始化逻辑
+    # Attack Init
     poison_loader = None
     malicious_clients_list = []
     
@@ -204,28 +203,21 @@ def run_single_mode(config, mode_name, mode_config):
         if isinstance(attack_methods, str): attack_methods = [attack_methods]
         
         print(f"  [Attack] Initializing PoisonLoader: {attack_methods}...")
-        # 修正1: 正确传递参数 (methods list, params dict)
         poison_loader = PoisonLoader(attack_methods, atk_conf)
         
-        # 修正2: 手动选择恶意客户端 (PoisonLoader类中未包含此逻辑)
-        # 默认使用 atk_conf['poison_ratio'] 作为恶意客户端比例
         p_ratio = atk_conf.get('poison_ratio', 0.0)
         num_malicious = int(fed_conf['total_clients'] * p_ratio)
         if num_malicious > 0:
             malicious_clients_list = sorted(random.sample(range(fed_conf['total_clients']), num_malicious))
         
-        # 修正3: 动态注入方法以适配 Client.py 的调用接口
-        # Client.py 需要: is_poisoned_client(uid), get_poisoned_dataloader(uid, loader)
         poison_loader.malicious_set = set(malicious_clients_list)
         
         def is_poisoned_client(uid):
             return uid in poison_loader.malicious_set
         
         def get_poisoned_dataloader(uid, origin_loader):
-            # 返回一个包装器，在迭代时应用 apply_data_poison
             return PoisonedDataLoaderWrapper(origin_loader, poison_loader)
             
-        # Monkey patch 绑定方法
         poison_loader.is_poisoned_client = is_poisoned_client
         poison_loader.get_poisoned_dataloader = get_poisoned_dataloader
         
@@ -260,7 +252,6 @@ def run_single_mode(config, mode_name, mode_config):
 
     clients = []
     for i in range(fed_conf['total_clients']):
-        # 传入修复后的 poison_loader
         c = Client(i, train_loaders[i], ModelClass, poison_loader)
         c.tee_adapter = TEEAdapter() 
         c.tee_adapter.initialized = True 
@@ -370,6 +361,7 @@ def run_single_mode(config, mode_name, mode_config):
         
         def fetch_share(helper_id, target_id):
             _, share_struct = task_tee_step3_shares(clients[helper_id], SEED_sss, SEED_mask_root, target_id, threshold, fed_conf['total_clients'])
+            if share_struct is None: return 0 # Fallback safety
             if target_id == 0: return share_struct['alpha']
             return share_struct['beta']
 
@@ -417,7 +409,6 @@ def run_single_mode(config, mode_name, mode_config):
         else:
             asr_history.append(0.0)
 
-        # 保存检查点
         save_result_with_config(
             os.path.join(current_dir, "results"),
             mode_name,
