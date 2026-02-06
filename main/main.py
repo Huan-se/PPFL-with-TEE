@@ -16,7 +16,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from Entity.Server import Server
+from Entity.Server0 import Server
 from Entity.Client import Client
 from _utils_.dataloader import get_dataloader
 from _utils_.poison_loader import PoisonLoader
@@ -28,7 +28,7 @@ from _utils_.save_config import save_result_with_config
 # 全局常量
 # ==========================================
 MOD = 9223372036854775783
-SCALE = 10000.0
+SCALE = 1000000.0
 
 def load_config(path):
     with open(path, 'r') as f:

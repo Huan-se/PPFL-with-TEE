@@ -10,13 +10,13 @@ from Defence.score import ScoreCalculator
 from Defence.kickout import KickoutManager
 from Defence.layers_proj_detect import Layers_Proj_Detector
 from _utils_.tee_adapter import TEEAdapter
-from Defence import sk
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# [关键] 必须与 C++ Enclave 保持一致
+# 定义大素数 (必须与 C++ Enclave 保持一致)
 MOD = 9223372036854775783
-SCALE = 10000.0
+# [调整] 保持与 C++ 一致，如果想提高精度，需同步修改 Enclave.cpp
+SCALE = 10000.0 
 
 class Server(object):
     def __init__(self, model_class, test_dataloader, device_str, detection_method="none", defense_config=None, seed=42, verbose=False, log_file_path=None, malicious_clients=None):
@@ -105,8 +105,7 @@ class Server(object):
         return weights
 
     def secure_aggregation(self, client_objects, active_ids, round_num):
-        # [DEBUG MARKER] 这是一个显眼的标记，证明新代码在运行
-        print(f"\n[Server] >>> STARTING V3 SECURE AGGREGATION (ROUND {round_num}) <<<")
+        if self.verbose: print(f"\n[Server] Starting Secure Aggregation (Round {round_num})...")
         weights_map = self.current_round_weights
         
         encrypted_grads = {}
@@ -157,14 +156,11 @@ class Server(object):
         delta = secret_vector[0]
         alpha_seed = secret_vector[1]
         beta_seeds = secret_vector[2:]
-        
-        # [DEBUG] 
-        print(f"  [DEBUG] Reconstructed Delta: {delta}")
 
         # 4. 消除掩码
-        print("  [Server] Unmasking and aggregating...")
+        if self.verbose: print("  [Server] Unmasking and aggregating...")
 
-        # 使用 Object 类型防止 sum 溢出
+        # 强制使用 object 类型进行大数运算
         agg_cipher_obj = np.zeros(total_params_len, dtype=object)
         for cid in u2_ids:
             agg_cipher_obj += encrypted_grads[cid].astype(object)
@@ -179,16 +175,12 @@ class Server(object):
             vec_B_sum += vec_B
         vec_B_sum %= MOD
 
-        # [FIX] 强制使用 Python int 计算标量系数
+        # [修复] 确保 coeff_M 计算使用 Python int
         coeff_M = int(1 - delta) % int(MOD)
         term_M = (coeff_M * vec_M) % MOD
         
-        # 核心消除
         result_int = (agg_cipher_obj - term_M - vec_B_sum) % MOD
         result_int = (result_int + MOD) % MOD
-        
-        # [DEBUG]
-        print(f"  [DEBUG] Result Int Sample: {result_int[:5]}")
         
         # 5. 反定点化
         threshold_neg = MOD // 2
@@ -197,9 +189,6 @@ class Server(object):
         temp_arr[mask_neg] -= MOD 
         result_float = temp_arr.astype(np.float32) / SCALE
         
-        # [DEBUG]
-        print(f"  [DEBUG] Result Float Sample: {result_float[:5]}")
-
         if np.isnan(result_float).any() or np.isinf(result_float).any():
             print("\n  [CRITICAL ERROR] NaN or Inf detected in aggregated gradients!")
             return 
@@ -207,7 +196,7 @@ class Server(object):
         self._apply_global_update(result_float)
         self.seed_global_0 = (self.seed_global_0 + 1) & 0x7FFFFFFF
 
-        print("  [Server] Secure aggregation completed successfully.")
+        if self.verbose: print("  [Server] Secure aggregation completed successfully.")
 
     def _update_global_direction_feature(self, current_round):
         try:
@@ -227,33 +216,41 @@ class Server(object):
         if len(shares) < threshold: return None
         selected_shares = shares[:threshold]
         
-        # [FIX] 强制转为 Python int 列表
+        # [关键修复] 强制转换为 Python int，防止 numpy.int64 在标量计算时溢出
         x_s = [int(s['x']) for s in selected_shares]
+        
         vec_len = len(selected_shares[0]['v'])
         reconstructed = np.zeros(vec_len, dtype=np.int64)
         
         for i in range(vec_len):
-            # [FIX] 强制转为 Python int 标量
+            # [关键修复] 提取 numpy 数组元素并强制转为 int
             y_s = [int(s['v'][i]) for s in selected_shares]
             secret_val = self._lagrange_interpolate_zero(x_s, y_s)
             reconstructed[i] = secret_val
         return reconstructed
 
     def _lagrange_interpolate_zero(self, x_s, y_s):
+        """
+        拉格朗日插值恢复 f(0)
+        输入必须是 Python 原生 int 列表，严禁使用 numpy 类型参与运算
+        """
         total = 0
         k = len(x_s)
-        MOD_INT = int(MOD) 
+        
+        MOD_INT = int(MOD) # 确保 MOD 是 Python int
         
         for j in range(k):
             numerator = 1
             denominator = 1
             for m in range(k):
                 if m == j: continue
-                # 纯 Python int 运算
+                # 使用 Python 大整数运算，不会溢出
                 numerator = (numerator * (0 - x_s[m])) % MOD_INT
                 denominator = (denominator * (x_s[j] - x_s[m])) % MOD_INT
             
+            # 计算模逆
             inv_den = pow(denominator, -1, MOD_INT)
+            
             lj_0 = (numerator * inv_den) % MOD_INT
             term = (y_s[j] * lj_0) % MOD_INT
             total = (total + term) % MOD_INT
@@ -267,6 +264,7 @@ class Server(object):
                 numel = param.numel()
                 grad_segment = update_flat[idx : idx+numel]
                 grad_tensor = torch.from_numpy(grad_segment).view(param.shape).to(self.device)
+                # w = w + update (gradient descent update)
                 param.data.add_(grad_tensor)
                 idx += numel
 
