@@ -26,7 +26,7 @@ namespace std { using ::rand; using ::srand; }
 
 #define CHUNK_SIZE 4096
 const int64_t MOD = 9223372036854775783;
-const double SCALE = 1000000.0;
+const double SCALE = 1000000000.0;
 // 48位掩码，保证 n_sum 累加不溢出 int64
 const uint64_t N_MASK = 0xFFFFFFFFFFFF; 
 
