@@ -6,7 +6,7 @@ experiment:
   save_dir: "results"
 
   thread_count: 20
-  use_multiprocessing: false
+  use_multiprocessing: true
   
   device: "cuda"  # auto, cuda, or cpu
   modes: "poison_with_detection"  #pure_training poison_no_detection poison_with_detection all

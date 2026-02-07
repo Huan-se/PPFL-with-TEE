@@ -3,7 +3,7 @@
         "seed": 42,
         "save_dir": "results",
         "thread_count": 20,
-        "use_multiprocessing": false,
+        "use_multiprocessing": true,
         "device": "cuda",
         "modes": "poison_with_detection",
         "verbose": true,

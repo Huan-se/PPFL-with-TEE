@@ -4,19 +4,17 @@ import copy
 import numpy as np
 import os
 import csv
-import time # [新增] 用于性能统计
+import time
 from collections import defaultdict
 
 from Defence.score import ScoreCalculator
 from Defence.kickout import KickoutManager
 from Defence.layers_proj_detect import Layers_Proj_Detector
-from _utils_.tee_adapter import TEEAdapter
+from _utils_.tee_adapter import get_tee_adapter_singleton # [修改] 导入单例获取函数
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# [关键] 必须与 C++ Enclave 保持一致
 MOD = 9223372036854775783
-SCALE = 1000000000.0  # [关键] 1e9
+SCALE = 1000000000.0
 
 class Server(object):
     def __init__(self, model_class, test_dataloader, device_str, detection_method="none", defense_config=None, seed=42, verbose=False, log_file_path=None, malicious_clients=None):
@@ -24,51 +22,38 @@ class Server(object):
         self.global_model = model_class().to(self.device)
         self.test_dataloader = test_dataloader
         self.criterion = nn.CrossEntropyLoss().to(self.device)
-        self.tee_adapter = TEEAdapter()
+        
+        # [核心修改] 使用全局唯一的 TEE 适配器
+        self.tee_adapter = get_tee_adapter_singleton()
 
         self.detection_method = detection_method
         self.verbose = verbose
         self.log_file_path = log_file_path
         self.seed = seed 
-        
         self.malicious_clients = set(malicious_clients) if malicious_clients else set()
         self.defense_config = defense_config or {}
-        
         self.suspect_counters = {} 
         self.global_update_direction = None 
         self.detection_history = defaultdict(lambda: {'suspect_cnt': 0, 'kicked_cnt': 0, 'events': []})
-        
         det_params = self.defense_config.get('params', {})
         self.mesas_detector = Layers_Proj_Detector(config=det_params)
-        
         self.score_calculator = ScoreCalculator() if "score" in detection_method else None
         self.kickout_manager = KickoutManager() if "kickout" in detection_method else None
         self.current_round_weights = {}
-
         self.seed_mask_root = 0x12345678 
         self.seed_global_0 = 0x87654321  
         self.seed_sss = 0x11223344
-        
         self.w_old_global_flat = self._flatten_params(self.global_model)
-
         should_log = any(k in self.detection_method for k in ["mesas", "projected", "layers_proj"])
-        if self.log_file_path and should_log:
-            self._init_log_file()
+        if self.log_file_path and should_log: self._init_log_file()
 
     def _init_log_file(self):
         log_dir = os.path.dirname(self.log_file_path)
         if log_dir: os.makedirs(log_dir, exist_ok=True)
-        headers = ["Round", "Client_ID", "Type", "Score", "Status"]
-        target_layers = self.defense_config.get('target_layers', [])
-        scopes = ['full'] + [f'layer_{name}' for name in target_layers]
-        metrics = ['l2', 'var', 'dist']
         try:
             with open(self.log_file_path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
-                for scope in scopes:
-                    for metric in metrics:
-                        headers.extend([f"{scope}_{metric}", f"{scope}_{metric}_threshold"])
-                writer.writerow(headers)
+                writer.writerow(["Round", "Client_ID", "Score", "Status"])
         except Exception: pass
         
     def _flatten_params(self, model):
@@ -85,70 +70,49 @@ class Server(object):
         client_projections = {cid: feat for cid, feat in zip(client_id_list, client_features_dict_list)}
         self._update_global_direction_feature(current_round)
         weights = {}
-
         if any(k in self.detection_method for k in ["mesas", "projected", "layers_proj"]):
             if self.verbose: print(f"  [Server] Executing {self.detection_method} detection (Round {current_round})...")
             raw_weights, logs, global_stats = self.mesas_detector.detect(
                 client_projections, self.global_update_direction, self.suspect_counters, verbose=self.verbose
             )
-            if self.log_file_path: self._write_detection_log(current_round, logs, raw_weights, global_stats)
-            for cid in sorted(logs.keys()):
-                status = logs[cid].get('status', 'NORMAL')
-                if "SUSPECT" in status: self.detection_history[cid]['suspect_cnt'] += 1
-                if "KICKED" in status: self.detection_history[cid]['kicked_cnt'] += 1
             total_score = sum(raw_weights.values())
             weights = {cid: s / total_score for cid, s in raw_weights.items()} if total_score > 0 else {cid: 0.0 for cid in raw_weights}
         else:
-            full_features = [f['full'] for f in client_features_dict_list]
-            weights = self._fallback_old_detection(client_id_list, full_features, client_data_sizes)
+            weights = {cid: 1.0/len(client_id_list) for cid in client_id_list}
         self.current_round_weights = weights
         return weights
 
     def secure_aggregation(self, client_objects, active_ids, round_num):
         print(f"\n[Server] >>> STARTING V4 SECURE AGGREGATION (ROUND {round_num}) [WITH PROFILE] <<<")
-        t_total_start = time.time() # [总计时开始]
-        
         weights_map = self.current_round_weights
-        
         encrypted_grads = {}
         online_clients = []
         total_params_len = sum(p.numel() for p in self.global_model.parameters())
 
-        # =========================================================
-        # [Profile Stage 1] 收集密文 (Collect & Encrypt)
-        # =========================================================
         t_collect_start = time.time()
-        
-        # 准备明文验证累加器
         plaintext_sum_accumulator = np.zeros(total_params_len, dtype=object)
         
         for client in client_objects:
             if client.client_id not in active_ids: continue
             w = weights_map.get(client.client_id, 0.0)
             if w <= 1e-9: continue
-            
             try:
-                # --- [TEE 路径] 上传密文 ---
                 c_grad = client.tee_step2_upload(w, active_ids, self.seed_mask_root, self.seed_global_0)
                 encrypted_grads[client.client_id] = c_grad
                 online_clients.append(client.client_id)
-
-                # --- [DEBUG 路径] 收集明文用于对比 ---
+                # Debug Check
                 w_client_flat = self._flatten_params(client.model)
                 grad_flat = w_client_flat - self.w_old_global_flat
                 grad_quantized = (grad_flat * w * SCALE).astype(np.int64)
                 plaintext_sum_accumulator += grad_quantized.astype(object)
-
             except Exception as e:
                 print(f"  [Warning] Upload failed for Client {client.client_id}: {e}")
         
         t_collect_end = time.time()
-
         if not online_clients:
             print("  [Error] No clients uploaded gradients.")
             return
 
-        # 2. 掉线恢复 (准备 Shares)
         u2_ids = sorted(online_clients)
         threshold = int(len(u2_ids) * 0.6) + 1
         if threshold < 2: threshold = 1
@@ -162,31 +126,18 @@ class Server(object):
                     shares_collected.append({'x': client.client_id + 1, 'v': share_vec})
                 except Exception as e: pass
 
-        if len(shares_collected) < threshold:
-            print(f"  [Error] Insufficient shares ({len(shares_collected)} < {threshold}).")
-            return
+        if len(shares_collected) < threshold: return
         
-        # =========================================================
-        # [Profile Stage 2] 秘密重构 (Reconstruct Secrets)
-        # =========================================================
         t_recon_start = time.time()
         secret_vector = self._reconstruct_secrets(shares_collected, threshold)
         t_recon_end = time.time()
-        
-        if secret_vector is None:
-            print("  [Error] Failed to reconstruct secrets.")
-            return
+        if secret_vector is None: return
 
         delta = secret_vector[0]
         alpha_seed = secret_vector[1]
         beta_seeds = secret_vector[2:]
         
-        # =========================================================
-        # [Profile Stage 3] 解密与聚合 (Unmask & Aggregate)
-        # =========================================================
         t_agg_start = time.time()
-        print("  [Server] Unmasking and aggregating...")
-
         agg_cipher_obj = np.zeros(total_params_len, dtype=object)
         for cid in u2_ids:
             agg_cipher_obj += encrypted_grads[cid].astype(object)
@@ -203,60 +154,34 @@ class Server(object):
 
         coeff_M = int(1 - delta) % int(MOD)
         term_M = (coeff_M * vec_M) % MOD
-        
         result_int = (agg_cipher_obj - term_M - vec_B_sum) % MOD
         result_int = (result_int + MOD) % MOD
         t_agg_end = time.time()
         
-        # =========================================================
-        # [Profile Stage 4] 验证 (Verification)
-        # =========================================================
         t_check_start = time.time()
-        print("\n  >>> [VERIFICATION] Comparing TEE Result vs. Plaintext Truth...")
-        
         plaintext_truth_mod = (plaintext_sum_accumulator % MOD + MOD) % MOD
         diff = np.abs(result_int - plaintext_truth_mod)
-        
-        # 允许误差阈值 (Scale 1e9 下，0.0001)
         TOLERANCE = 100000 
-        
         diff_count = np.count_nonzero(diff > TOLERANCE)
-        
         if diff_count == 0:
-            print("  >>> [SUCCESS] CHECK PASSED! (Within tolerance)")
+            print("  >>> [SUCCESS] CHECK PASSED!")
         else:
-            print(f"  >>> [WARNING] CHECK DIFF! {diff_count} params differ significantly.")
-            print(f"  >>> Max Diff: {np.max(diff)}")
+            print(f"  >>> [WARNING] CHECK DIFF! {diff_count} params differ.")
+            print(f"  >>> [WARNING] MAX DIFF {diff.max()}")
         t_check_end = time.time()
 
-        # 5. 反定点化
         threshold_neg = MOD // 2
         mask_neg = result_int > threshold_neg
         temp_arr = np.array(result_int, dtype=object)
         temp_arr[mask_neg] -= MOD 
         result_float = temp_arr.astype(np.float32) / SCALE
         
-        # [DEBUG]
-        print(f"  [DEBUG] Final Gradient Float Sample: {result_float[:5]}")
-
         if np.isnan(result_float).any() or np.isinf(result_float).any():
-            print("\n  [CRITICAL ERROR] NaN or Inf detected in aggregated gradients!")
+            print("\n  [CRITICAL ERROR] NaN or Inf detected!")
             return 
 
         self._apply_global_update(result_float)
         self.seed_global_0 = (self.seed_global_0 + 1) & 0x7FFFFFFF
-
-        t_total_end = time.time()
-        
-        # [打印性能报表]
-        print("-" * 60)
-        print("  [Performance Profile]")
-        print(f"  1. Collect & Encrypt (Client TEE): {t_collect_end - t_collect_start:.4f}s")
-        print(f"  2. Reconstruct Secrets (Py-Math):  {t_recon_end - t_recon_start:.4f}s")
-        print(f"  3. Unmask & Aggregate (TEE+NumPy): {t_agg_end - t_agg_start:.4f}s")
-        print(f"  4. Verification Check (NumPy):     {t_check_end - t_check_start:.4f}s")
-        print(f"  >> Total Aggregation Time:         {t_total_end - t_total_start:.4f}s")
-        print("-" * 60)
 
     def _update_global_direction_feature(self, current_round):
         try:
@@ -269,7 +194,6 @@ class Server(object):
             )
             self.global_update_direction = {'full': projection, 'layers': {}}
         except Exception as e:
-            print(f"  [Warning] Global direction projection failed: {e}")
             self.global_update_direction = None
 
     def _reconstruct_secrets(self, shares, threshold):
@@ -310,24 +234,13 @@ class Server(object):
                 param.data.add_(grad_tensor)
                 idx += numel
 
-    def _fallback_old_detection(self, ids, f, s):
-        return {cid: 1.0/len(ids) for cid in ids}
-    def _write_detection_log(self, r, l, w, s): pass 
-    
     def evaluate(self):
-        """
-        [关键修复] 评估时使用 train() 模式，让 BN 层使用 Batch 统计值
-        解决 '权重正确但 Server Acc 为 10%' 的问题
-        """
-        self.global_model.eval()
+        # [核心修复] 
+        # 1. 切换到 train 模式以使用 batch 统计量 (避免因 Server 无 running_stats 导致的低 Acc)
+        # 2. 绝对不要将 track_running_stats 设为 False 或将 running_mean/var 设为 None，
+        #    否则 state_dict 会缺损，导致下一轮 Client 加载模型时崩溃。
+        self.global_model.train() 
         
-        # 强制 BN 层忽略全局统计量
-        for m in self.global_model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                m.track_running_stats = False
-                m.running_mean = None
-                m.running_var = None
-                
         test_loss, correct, total = 0, 0, 0
         with torch.no_grad():
             for inputs, targets in self.test_dataloader:
@@ -337,12 +250,6 @@ class Server(object):
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
-        
-        # 恢复 BN 层状态 (虽然 evaluate 结束了，但为了保持状态一致性)
-        for m in self.global_model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                m.track_running_stats = True
-                
         return 100.*correct/total, test_loss/len(self.test_dataloader)
 
     def evaluate_asr(self, loader, atype, aparams): return 0.0

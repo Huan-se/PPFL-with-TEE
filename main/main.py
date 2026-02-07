@@ -23,16 +23,7 @@ from _utils_.poison_loader import PoisonLoader
 from model.Cifar10Net import CIFAR10Net
 from model.Lenet5 import LeNet5
 from _utils_.save_config import save_result_with_config
-
-# ==========================================
-# 全局常量
-# ==========================================
-MOD = 9223372036854775783
-SCALE = 1000000000.0
-
-def load_config(path):
-    with open(path, 'r') as f:
-        return yaml.safe_load(f)
+from _utils_.tee_adapter import get_tee_adapter_singleton
 
 # ==========================================
 # 辅助函数
@@ -42,6 +33,10 @@ def flatten_params(model):
     for param in model.parameters():
         params.append(param.data.view(-1).cpu().numpy())
     return np.concatenate(params).astype(np.float32)
+
+def load_config(path):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
 
 # ==========================================
 # 辅助类：投毒数据加载器包装器
@@ -61,33 +56,30 @@ class PoisonedDataLoaderWrapper:
         return len(self.dataloader)
 
 # ==========================================
-# 并行任务 (Thread Safe)
+# 并行任务包装器 (Wrapper Functions)
 # ==========================================
 
-def task_tee_step1_train_prepare(client, global_params_cpu, w_old_flat, proj_seed, target_layers, device_str):
+def task_phase1_train(client, epochs):
+    """Phase 1: 纯训练任务"""
     try:
-        device = torch.device(device_str)
-        if client.model is None:
-            client.model = client.model_class().to(device)
-        else:
-            if next(client.model.parameters()).device != device:
-                 client.model = client.model.to(device)
+        # 调用 Client 内部的 phase1_local_train
+        train_time = client.phase1_local_train(epochs)
+        return client.client_id, train_time, None
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return client.client_id, 0, str(e)
+
+def task_phase2_tee(client, proj_seed):
+    """Phase 2: 纯 TEE 处理任务"""
+    try:
+        # 调用 Client 内部的 phase2_tee_process
+        feature_dict, data_size = client.phase2_tee_process(proj_seed)
         
-        # 加载全局参数
-        global_params_device = {k: v.to(device) for k, v in global_params_cpu.items()}
-        if hasattr(client, 'receive_model'):
-            client.receive_model(global_params_device)
-        else:
-            client.model.load_state_dict(global_params_device)
-            
-        # 本地训练 (日志会在 Client 内部打印)
-        client.local_train()
-        
-        # TEE 准备
-        feature_dict, data_size = client.tee_step1_prepare(w_old_flat, proj_seed, target_layers)
-        
+        # 将 numpy 转换为 tensor 供 Server 检测模块使用 (CPU端)
         feature_dict_cpu = {'full': torch.from_numpy(feature_dict['full']), 'layers': {}}
-        if 'layers' in feature_dict:
+        # 如果有分层特征，也进行转换
+        if 'layers' in feature_dict and feature_dict['layers']:
             for k, v in feature_dict['layers'].items():
                 feature_dict_cpu['layers'][k] = torch.from_numpy(v)
                 
@@ -113,19 +105,20 @@ def run_single_mode(config, mode_name, mode_config):
     seed = exp_conf['seed']
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     
+    # 检测设备并设置策略
     device_str = exp_conf['device']
+    if torch.cuda.is_available() and 'cuda' in device_str:
+        print("  [System] CUDA GPU Detected. Optimized for Single-GPU Training.")
+        device_str = 'cuda'
+    else:
+        print("  [System] Using CPU.")
+        device_str = 'cpu'
     
     use_multiprocessing = exp_conf.get('use_multiprocessing', False)
     worker_count = exp_conf.get('thread_count', 4)
     
-    if use_multiprocessing:
-        print(f"  [System] Parallel Mode Enabled: Using {worker_count} Threads (Training Phase).")
-        ExecutorClass = ThreadPoolExecutor
-    else:
-        print("  [System] Serial Mode.")
-        ExecutorClass = None 
-
     print(f"  [Init] Loading dataset {data_conf['dataset']}...")
+    # 使用真实的 get_dataloader
     train_loaders, test_loader = get_dataloader(
         data_conf['dataset'], 
         fed_conf['total_clients'], 
@@ -138,7 +131,7 @@ def run_single_mode(config, mode_name, mode_config):
     elif data_conf['model'] == 'mnist': ModelClass = LeNet5
     else: raise ValueError(f"Unknown model: {data_conf['model']}")
         
-    # Attack Init
+    # --- Attack Init ---
     poison_loader = None
     malicious_clients_list = []
     
@@ -173,6 +166,7 @@ def run_single_mode(config, mode_name, mode_config):
     log_name = f"{mode_name}_{data_conf['dataset']}_{data_conf['model']}_{detection_method}_{atk_conf['active_attacks'] or 'NoAttack'}_p{atk_conf['poison_ratio']:.2f}_{'NonIID' if data_conf['if_noniid'] else 'IID'}"
     log_path = os.path.join(current_dir, "results", f"{log_name}_detection_log.csv")
     
+    # --- Init Server ---
     server = Server(
         model_class=ModelClass,
         test_dataloader=test_loader,
@@ -185,15 +179,21 @@ def run_single_mode(config, mode_name, mode_config):
         malicious_clients=malicious_clients_list
     )
     
+    # --- Init Clients ---
     clients = []
     for i in range(fed_conf['total_clients']):
-        # [修改] 强制 verbose=True 以便打印训练日志
-        c = Client(i, train_loaders[i], ModelClass, poison_loader, verbose=True)
+        # 传递 device_str 确保 Client 使用正确的设备
+        c = Client(i, train_loaders[i], ModelClass, poison_loader, device_str=device_str, verbose=(i==0))
         clients.append(c)
-        
+
+    # --- [关键] 预初始化 TEE ---
+    print("  [System] Pre-initializing TEE Enclave (Global Singleton)...")
+    adapter = get_tee_adapter_singleton()
+    adapter.initialize_enclave()
+    
     current_w_old_flat = flatten_params(server.global_model)
     total_rounds = fed_conf['comm_rounds']
-    target_layers_config = mode_config.get('target_layers', None)
+    local_epochs = fed_conf['local_epochs']
     
     acc_history = []
     asr_history = []
@@ -201,26 +201,63 @@ def run_single_mode(config, mode_name, mode_config):
     # === Main Loop ===
     for r in range(1, total_rounds + 1):
         print(f"\n>>> Round {r}/{total_rounds} Start...")
-        start_time = time.time()
+        round_start_time = time.time()
         
+        # Step 1: Client Selection
         active_ids = random.sample(range(fed_conf['total_clients']), fed_conf['active_clients'])
         active_ids.sort()
         
+        # Step 2: Global Model Distribution (Serial, Fast)
         global_params, _ = server.get_global_params_and_proj()
         global_params_cpu = {k: v.cpu() for k, v in global_params.items()}
         current_proj_seed = int(seed + r)
         
-        # --- Phase 2: Train & Prepare ---
+        # 客户端接收参数 (同时缓存 w_old)
+        for cid in range(fed_conf['total_clients']):
+             # 这里可以只给 active 的发，但为了保持状态一致性，通常全发
+             clients[cid].receive_model(global_params)
+
+        # -------------------------------------------------------------
+        # Phase 1: Parallel Training
+        # -------------------------------------------------------------
+        # 策略：CUDA -> 串行 (workers=1); CPU -> 并行
+        train_workers = 1 if device_str == "cuda" else min(5, worker_count)
+        print(f"  [Phase 1] Starting Local Training (Device: {device_str}, Workers: {train_workers})...")
+        t_p1_start = time.time()
+
+        if use_multiprocessing:
+            with ThreadPoolExecutor(max_workers=train_workers) as executor:
+                futures = {
+                    executor.submit(task_phase1_train, clients[cid], local_epochs): cid 
+                    for cid in active_ids
+                }
+                for future in as_completed(futures):
+                    cid, t_cost, err = future.result()
+                    if err: print(f"  [Error] Client {cid} Train: {err}")
+        else:
+            # Fallback to serial
+            for cid in active_ids:
+                task_phase1_train(clients[cid], local_epochs)
+        
+        t_p1_end = time.time()
+        print(f"  >> Training Phase Finished in {t_p1_end - t_p1_start:.2f}s")
+
+        # -------------------------------------------------------------
+        # Phase 2: Parallel TEE Processing
+        # -------------------------------------------------------------
+        # 策略：CPU Bound & GIL Released -> 全速并行
+        tee_workers = worker_count 
+        print(f"  [Phase 2] Starting TEE Processing (Workers: {tee_workers})...")
+        t_p2_start = time.time()
+        
         client_features_dict_list = {}
         client_data_sizes = {}
         
-        if ExecutorClass:
-            with ExecutorClass(max_workers=worker_count) as executor:
+        if use_multiprocessing:
+            with ThreadPoolExecutor(max_workers=tee_workers) as executor:
                 futures = {
-                    executor.submit(
-                        task_tee_step1_train_prepare, 
-                        clients[cid], global_params_cpu, current_w_old_flat, current_proj_seed, target_layers_config, device_str
-                    ): cid for cid in active_ids
+                    executor.submit(task_phase2_tee, clients[cid], current_proj_seed): cid 
+                    for cid in active_ids
                 }
                 for future in as_completed(futures):
                     cid, feats, dsize, err = future.result()
@@ -228,35 +265,33 @@ def run_single_mode(config, mode_name, mode_config):
                         client_features_dict_list[cid] = feats
                         client_data_sizes[cid] = dsize
                     else:
-                        print(f"  [Error] Client {cid}: {err}")
+                        print(f"  [Error] Client {cid} TEE: {err}")
         else:
             for cid in active_ids:
-                _, feats, dsize, err = task_tee_step1_train_prepare(
-                    clients[cid], global_params_cpu, current_w_old_flat, current_proj_seed, target_layers_config, device_str
-                )
+                _, feats, dsize, err = task_phase2_tee(clients[cid], current_proj_seed)
                 if feats:
                     client_features_dict_list[cid] = feats
                     client_data_sizes[cid] = dsize
 
-        # --- Phase 3: Defense ---
+        t_p2_end = time.time()
+        print(f"  >> TEE Phase Finished in {t_p2_end - t_p2_start:.2f}s")
+
+        # --- Phase 3: Defense & Aggregation ---
         valid_ids = [cid for cid in active_ids if cid in client_features_dict_list]
         feature_list = [client_features_dict_list[cid] for cid in valid_ids]
         size_list = [client_data_sizes[cid] for cid in valid_ids]
         
+        # 计算权重 (防御)
         weights_map = server.calculate_weights(valid_ids, feature_list, size_list, current_round=r)
         
         accepted_ids = [cid for cid, w in weights_map.items() if w > 1e-6]
         accepted_ids.sort()
         
-        kicked_count = len(valid_ids) - len(accepted_ids)
-        if kicked_count > 0: 
-            print(f"  [Defence] Kicked {kicked_count} clients.")
-        
         if not accepted_ids: 
-            print("  [Warning] No accepted clients this round. Skipping aggregation.")
+            print("  [Warning] No accepted clients. Skipping aggregation.")
             continue
 
-        # --- Phase 4 & 5: Secure Aggregation (Delegated to Server) ---
+        # 安全聚合 (Server 内部串行调用 upload，但因为 Phase 2 做了准备，所以很快)
         server.secure_aggregation(clients, accepted_ids, round_num=r)
 
         current_w_old_flat = flatten_params(server.global_model)
@@ -264,10 +299,12 @@ def run_single_mode(config, mode_name, mode_config):
         # 评估
         acc, loss = server.evaluate()
         acc_history.append(acc)
-        print(f"  [Round {r}] Global Acc: {acc:.2f}%, Loss: {loss:.4f} | Time: {time.time()-start_time:.1f}s")
+        
+        round_end_time = time.time()
+        print(f"  [Round {r}] Global Acc: {acc:.2f}%, Loss: {loss:.4f}")
+        print(f"  Time Breakdown: Train={t_p1_end-t_p1_start:.1f}s, TEE={t_p2_end-t_p2_start:.1f}s, Agg={round_end_time-t_p2_end:.1f}s")
         
         if atk_conf.get('active_attacks'):
-            # [Fix] 使用 .get() 避免 KeyError
             attack_params = atk_conf.get('attack_params', {})
             asr = server.evaluate_asr(test_loader, atk_conf['active_attacks'], attack_params)
             asr_history.append(asr)
