@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import Subset, DataLoader
-
+import os
 
 def get_transform(dataset_name):
     """获取对应数据集的预处理转换"""
@@ -19,10 +19,12 @@ def get_transform(dataset_name):
     else:
         raise ValueError(f"不支持的数据集: {dataset_name}")
 
-
 def load_dataset(dataset_name, data_dir="./data"):
     """加载指定数据集的训练集和测试集"""
-    # 这里的 transforms 引用是多余的，已经在上面导入
+    # 确保数据目录存在
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+
     transform = get_transform(dataset_name)
 
     if dataset_name == "mnist":
@@ -44,7 +46,6 @@ def load_dataset(dataset_name, data_dir="./data"):
 
     return train_dataset, test_dataset
 
-
 def split_iid(dataset, num_clients, batch_size):
     """IID数据划分"""
     total_size = len(dataset)
@@ -65,15 +66,16 @@ def split_iid(dataset, num_clients, batch_size):
     for indices in client_indices:
         # 确保数据量不小于批次大小
         if len(indices) < batch_size:
+            # 如果数据不够一个batch，简单复制填充（边缘情况）
             while len(indices) < batch_size:
                 indices.extend(indices[:min(len(indices), batch_size - len(indices))])
+        
         subset = Subset(dataset, indices)
         client_dataloaders.append(
             DataLoader(subset, batch_size=batch_size, shuffle=True)
         )
 
     return client_dataloaders
-
 
 def split_noniid(dataset, num_clients, batch_size, dataset_name, alpha=0.1):
     """Non-IID数据划分（基于Dirichlet分布）"""
@@ -82,7 +84,8 @@ def split_noniid(dataset, num_clients, batch_size, dataset_name, alpha=0.1):
     elif dataset_name == "cifar10":
         targets = np.array(dataset.targets)
     else:
-        raise ValueError(f"不支持的数据集: {dataset_name}")
+        # 尝试通用获取
+        targets = np.array(dataset.targets)
 
     classes = np.unique(targets)
     client_indices = [[] for _ in range(num_clients)]
@@ -91,26 +94,31 @@ def split_noniid(dataset, num_clients, batch_size, dataset_name, alpha=0.1):
     for c in classes:
         # 为每个类别生成Dirichlet分布的客户端分配权重
         dirichlet_weights = np.random.dirichlet(np.ones(num_clients) * alpha)
+        # 归一化并计算划分点
+        dirichlet_weights = dirichlet_weights / dirichlet_weights.sum()
         class_size = len(class_indices[c])
-        # 按权重划分当前类别的数据
-        # 防止 split 空数组报错
-        if class_size > 0:
-            split_points = np.cumsum(dirichlet_weights[:-1] * class_size).astype(int)
-            client_split = np.split(class_indices[c], split_points)
-            for i, idx in enumerate(client_split):
-                client_indices[i].extend(idx.tolist())
+        
+        split_points = (np.cumsum(dirichlet_weights) * class_size).astype(int)[:-1]
+        client_split = np.split(class_indices[c], split_points)
+        
+        for i, idx in enumerate(client_split):
+            client_indices[i].extend(idx.tolist())
 
     # 创建数据加载器
     client_dataloaders = []
     for indices in client_indices:
-        # 即使某个客户端分到的数据很少，也要处理
-        if len(indices) == 0:
-            # 极端情况：分配少量随机数据防止报错
-            indices = np.random.choice(len(dataset), batch_size).tolist()
+        # 混洗当前客户端的索引
+        np.random.shuffle(indices)
         
+        # 确保数据量不小于批次大小
         if len(indices) < batch_size:
-            while len(indices) < batch_size:
-                indices.extend(indices[:min(len(indices), batch_size - len(indices))])
+             if len(indices) == 0:
+                 # 极端Non-IID可能导致某客户端无数据，防止报错分配少量随机数据
+                 print(f"Warning: Client has no data for Non-IID alpha={alpha}. Assigning random sample.")
+                 indices = np.random.choice(len(dataset), batch_size).tolist()
+             else:
+                while len(indices) < batch_size:
+                    indices.extend(indices[:min(len(indices), batch_size - len(indices))])
         
         subset = Subset(dataset, indices)
         client_dataloaders.append(
@@ -119,31 +127,35 @@ def split_noniid(dataset, num_clients, batch_size, dataset_name, alpha=0.1):
 
     return client_dataloaders
 
-
-def get_dataloader(dataset_name, num_users, batch_size, non_iid=True, alpha=0.1, data_dir="./data"):
+def load_and_split_dataset(dataset_name, num_clients, batch_size, if_noniid=True, alpha=0.1, data_dir="./main/data"):
     """
     统一接口：加载并划分数据集
-    (已重命名为 get_dataloader 并调整参数名以匹配 main.py)
 
     参数:
-        dataset_name: 数据集名称
-        num_users: 客户端数量 (对应 main.py 的 num_users)
+        dataset_name: 数据集名称 ("mnist" 或 "cifar10")
+        num_clients: 客户端数量
         batch_size: 批次大小
-        non_iid: 是否使用Non-IID划分 (对应 main.py 的 non_iid)
-        alpha: Dirichlet参数
-        data_dir: 数据路径
+        if_noniid: 是否使用Non-IID划分
+        alpha: Dirichlet分布参数（仅Non-IID时有效）
+        data_dir: 数据存储路径
+
+    返回:
+        client_dataloaders: 客户端数据加载器列表
+        test_loader: 测试集数据加载器
     """
     # 加载原始数据集
     train_dataset, test_dataset = load_dataset(dataset_name, data_dir)
 
     # 划分训练集
-    if non_iid:
+    if if_noniid:
+        print(f"  [Data] Splitting {dataset_name} Non-IID (alpha={alpha})...")
         client_dataloaders = split_noniid(
-            train_dataset, num_users, batch_size, dataset_name, alpha
+            train_dataset, num_clients, batch_size, dataset_name, alpha
         )
     else:
+        print(f"  [Data] Splitting {dataset_name} IID...")
         client_dataloaders = split_iid(
-            train_dataset, num_users, batch_size
+            train_dataset, num_clients, batch_size
         )
 
     # 创建测试集加载器

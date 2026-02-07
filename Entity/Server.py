@@ -10,7 +10,7 @@ from collections import defaultdict
 from Defence.score import ScoreCalculator
 from Defence.kickout import KickoutManager
 from Defence.layers_proj_detect import Layers_Proj_Detector
-from _utils_.tee_adapter import get_tee_adapter_singleton # [修改] 导入单例获取函数
+from _utils_.tee_adapter import get_tee_adapter_singleton
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MOD = 9223372036854775783
@@ -23,7 +23,6 @@ class Server(object):
         self.test_dataloader = test_dataloader
         self.criterion = nn.CrossEntropyLoss().to(self.device)
         
-        # [核心修改] 使用全局唯一的 TEE 适配器
         self.tee_adapter = get_tee_adapter_singleton()
 
         self.detection_method = detection_method
@@ -75,12 +74,31 @@ class Server(object):
             raw_weights, logs, global_stats = self.mesas_detector.detect(
                 client_projections, self.global_update_direction, self.suspect_counters, verbose=self.verbose
             )
+            if self.log_file_path: self._write_detection_log(current_round, logs, raw_weights, global_stats)
+            for cid in sorted(logs.keys()):
+                status = logs[cid].get('status', 'NORMAL')
+                if "SUSPECT" in status: self.detection_history[cid]['suspect_cnt'] += 1
+                if "KICKED" in status: self.detection_history[cid]['kicked_cnt'] += 1
             total_score = sum(raw_weights.values())
             weights = {cid: s / total_score for cid, s in raw_weights.items()} if total_score > 0 else {cid: 0.0 for cid in raw_weights}
         else:
             weights = {cid: 1.0/len(client_id_list) for cid in client_id_list}
         self.current_round_weights = weights
         return weights
+
+    def _write_detection_log(self, round_num, logs, weights, global_stats):
+        if not self.log_file_path: return
+        try:
+            with open(self.log_file_path, 'a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                for cid in sorted(logs.keys()):
+                    info = logs[cid]
+                    score = weights.get(cid, 0.0)
+                    status = info.get('status', 'NORMAL')
+                    row = [round_num, cid, "Client", f"{score:.4f}", status]
+                    # 补充 metric 详情... (这里简化处理，只写基本信息)
+                    writer.writerow(row)
+        except Exception: pass
 
     def secure_aggregation(self, client_objects, active_ids, round_num):
         print(f"\n[Server] >>> STARTING V4 SECURE AGGREGATION (ROUND {round_num}) [WITH PROFILE] <<<")
@@ -167,7 +185,7 @@ class Server(object):
             print("  >>> [SUCCESS] CHECK PASSED!")
         else:
             print(f"  >>> [WARNING] CHECK DIFF! {diff_count} params differ.")
-            print(f"  >>> [WARNING] MAX DIFF {diff.max()}")
+            print(f"  >>> [WARNING] MAX DIFF {np.max(diff)}")
         t_check_end = time.time()
 
         threshold_neg = MOD // 2
@@ -235,12 +253,11 @@ class Server(object):
                 idx += numel
 
     def evaluate(self):
-        # [核心修复] 
-        # 1. 切换到 train 模式以使用 batch 统计量 (避免因 Server 无 running_stats 导致的低 Acc)
-        # 2. 绝对不要将 track_running_stats 设为 False 或将 running_mean/var 设为 None，
-        #    否则 state_dict 会缺损，导致下一轮 Client 加载模型时崩溃。
         self.global_model.train() 
-        
+        for m in self.global_model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                m.track_running_stats = False
+                
         test_loss, correct, total = 0, 0, 0
         with torch.no_grad():
             for inputs, targets in self.test_dataloader:
@@ -250,6 +267,62 @@ class Server(object):
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
+        
+        for m in self.global_model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                m.track_running_stats = True
+                
         return 100.*correct/total, test_loss/len(self.test_dataloader)
 
-    def evaluate_asr(self, loader, atype, aparams): return 0.0
+    def evaluate_asr(self, loader, poison_loader):
+        """
+        [修复] 攻击成功率评估
+        """
+        self.global_model.train() 
+        for m in self.global_model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                m.track_running_stats = False
+
+        correct = 0
+        total = 0
+        
+        # [核心修复] 动态获取 Target Class，不依赖不存在的属性
+        target_class = None
+        params = poison_loader.attack_params
+        
+        if "backdoor" in poison_loader.attack_methods:
+            target_class = params.get("backdoor_target", 0) # 默认为0
+        elif "label_flip" in poison_loader.attack_methods:
+            target_class = params.get("target_class", 7)    # 默认为7
+            
+        if target_class is None:
+            # 如果没有定向攻击，ASR 为 0 (或者定义为其他)
+            return 0.0
+        
+        with torch.no_grad():
+            for data, target in loader:
+                # 1. 过滤掉本身就是目标类别的样本
+                non_target_indices = torch.where(target != target_class)[0]
+                if len(non_target_indices) == 0: continue
+                
+                data_subset = data[non_target_indices]
+                target_subset = target[non_target_indices]
+                
+                # 2. 投毒
+                data_poisoned, target_poisoned = poison_loader.apply_data_poison(data_subset, target_subset)
+                data_poisoned = data_poisoned.to(self.device)
+                target_poisoned = target_poisoned.to(self.device)
+                
+                # 3. 推理
+                output = self.global_model(data_poisoned)
+                _, predicted = output.max(1)
+                
+                total += len(target_poisoned)
+                correct += predicted.eq(target_poisoned).sum().item()
+
+        for m in self.global_model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                m.track_running_stats = True
+                
+        if total == 0: return 0.0
+        return 100. * correct / total
