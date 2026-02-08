@@ -3,7 +3,8 @@
 
 typedef struct ms_ecall_prepare_gradient_t {
 	int ms_client_id;
-	long int ms_proj_seed;
+	const char* ms_proj_seed_str;
+	size_t ms_proj_seed_str_len;
 	float* ms_w_new;
 	float* ms_w_old;
 	size_t ms_model_len;
@@ -14,12 +15,15 @@ typedef struct ms_ecall_prepare_gradient_t {
 } ms_ecall_prepare_gradient_t;
 
 typedef struct ms_ecall_generate_masked_gradient_dynamic_t {
-	long int ms_seed_mask_root;
-	long int ms_seed_global_0;
+	const char* ms_seed_mask_root_str;
+	size_t ms_seed_mask_root_str_len;
+	const char* ms_seed_global_0_str;
+	size_t ms_seed_global_0_str_len;
 	int ms_client_id;
 	int* ms_active_ids;
 	size_t ms_active_count;
-	float ms_k_weight;
+	const char* ms_k_weight_str;
+	size_t ms_k_weight_str_len;
 	size_t ms_model_len;
 	int* ms_ranges;
 	size_t ms_ranges_len;
@@ -28,8 +32,10 @@ typedef struct ms_ecall_generate_masked_gradient_dynamic_t {
 } ms_ecall_generate_masked_gradient_dynamic_t;
 
 typedef struct ms_ecall_get_vector_shares_dynamic_t {
-	long int ms_seed_sss;
-	long int ms_seed_mask_root;
+	const char* ms_seed_sss_str;
+	size_t ms_seed_sss_str_len;
+	const char* ms_seed_mask_root_str;
+	size_t ms_seed_mask_root_str_len;
 	int* ms_u1_ids;
 	size_t ms_u1_len;
 	int* ms_u2_ids;
@@ -41,7 +47,8 @@ typedef struct ms_ecall_get_vector_shares_dynamic_t {
 } ms_ecall_get_vector_shares_dynamic_t;
 
 typedef struct ms_ecall_generate_noise_from_seed_t {
-	long int ms_seed;
+	const char* ms_seed_str;
+	size_t ms_seed_str_len;
 	size_t ms_len;
 	long long* ms_output;
 } ms_ecall_generate_noise_from_seed_t;
@@ -140,12 +147,13 @@ static const struct {
 		(void*)Enclave_sgx_thread_set_multiple_untrusted_events_ocall,
 	}
 };
-sgx_status_t ecall_prepare_gradient(sgx_enclave_id_t eid, int client_id, long int proj_seed, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output_proj, size_t out_len)
+sgx_status_t ecall_prepare_gradient(sgx_enclave_id_t eid, int client_id, const char* proj_seed_str, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output_proj, size_t out_len)
 {
 	sgx_status_t status;
 	ms_ecall_prepare_gradient_t ms;
 	ms.ms_client_id = client_id;
-	ms.ms_proj_seed = proj_seed;
+	ms.ms_proj_seed_str = proj_seed_str;
+	ms.ms_proj_seed_str_len = proj_seed_str ? strlen(proj_seed_str) + 1 : 0;
 	ms.ms_w_new = w_new;
 	ms.ms_w_old = w_old;
 	ms.ms_model_len = model_len;
@@ -157,16 +165,19 @@ sgx_status_t ecall_prepare_gradient(sgx_enclave_id_t eid, int client_id, long in
 	return status;
 }
 
-sgx_status_t ecall_generate_masked_gradient_dynamic(sgx_enclave_id_t eid, long int seed_mask_root, long int seed_global_0, int client_id, int* active_ids, size_t active_count, float k_weight, size_t model_len, int* ranges, size_t ranges_len, long long* output, size_t out_len)
+sgx_status_t ecall_generate_masked_gradient_dynamic(sgx_enclave_id_t eid, const char* seed_mask_root_str, const char* seed_global_0_str, int client_id, int* active_ids, size_t active_count, const char* k_weight_str, size_t model_len, int* ranges, size_t ranges_len, long long* output, size_t out_len)
 {
 	sgx_status_t status;
 	ms_ecall_generate_masked_gradient_dynamic_t ms;
-	ms.ms_seed_mask_root = seed_mask_root;
-	ms.ms_seed_global_0 = seed_global_0;
+	ms.ms_seed_mask_root_str = seed_mask_root_str;
+	ms.ms_seed_mask_root_str_len = seed_mask_root_str ? strlen(seed_mask_root_str) + 1 : 0;
+	ms.ms_seed_global_0_str = seed_global_0_str;
+	ms.ms_seed_global_0_str_len = seed_global_0_str ? strlen(seed_global_0_str) + 1 : 0;
 	ms.ms_client_id = client_id;
 	ms.ms_active_ids = active_ids;
 	ms.ms_active_count = active_count;
-	ms.ms_k_weight = k_weight;
+	ms.ms_k_weight_str = k_weight_str;
+	ms.ms_k_weight_str_len = k_weight_str ? strlen(k_weight_str) + 1 : 0;
 	ms.ms_model_len = model_len;
 	ms.ms_ranges = ranges;
 	ms.ms_ranges_len = ranges_len;
@@ -176,12 +187,14 @@ sgx_status_t ecall_generate_masked_gradient_dynamic(sgx_enclave_id_t eid, long i
 	return status;
 }
 
-sgx_status_t ecall_get_vector_shares_dynamic(sgx_enclave_id_t eid, long int seed_sss, long int seed_mask_root, int* u1_ids, size_t u1_len, int* u2_ids, size_t u2_len, int my_client_id, int threshold, long long* output_vector, size_t out_max_len)
+sgx_status_t ecall_get_vector_shares_dynamic(sgx_enclave_id_t eid, const char* seed_sss_str, const char* seed_mask_root_str, int* u1_ids, size_t u1_len, int* u2_ids, size_t u2_len, int my_client_id, int threshold, long long* output_vector, size_t out_max_len)
 {
 	sgx_status_t status;
 	ms_ecall_get_vector_shares_dynamic_t ms;
-	ms.ms_seed_sss = seed_sss;
-	ms.ms_seed_mask_root = seed_mask_root;
+	ms.ms_seed_sss_str = seed_sss_str;
+	ms.ms_seed_sss_str_len = seed_sss_str ? strlen(seed_sss_str) + 1 : 0;
+	ms.ms_seed_mask_root_str = seed_mask_root_str;
+	ms.ms_seed_mask_root_str_len = seed_mask_root_str ? strlen(seed_mask_root_str) + 1 : 0;
 	ms.ms_u1_ids = u1_ids;
 	ms.ms_u1_len = u1_len;
 	ms.ms_u2_ids = u2_ids;
@@ -194,11 +207,12 @@ sgx_status_t ecall_get_vector_shares_dynamic(sgx_enclave_id_t eid, long int seed
 	return status;
 }
 
-sgx_status_t ecall_generate_noise_from_seed(sgx_enclave_id_t eid, long int seed, size_t len, long long* output)
+sgx_status_t ecall_generate_noise_from_seed(sgx_enclave_id_t eid, const char* seed_str, size_t len, long long* output)
 {
 	sgx_status_t status;
 	ms_ecall_generate_noise_from_seed_t ms;
-	ms.ms_seed = seed;
+	ms.ms_seed_str = seed_str;
+	ms.ms_seed_str_len = seed_str ? strlen(seed_str) + 1 : 0;
 	ms.ms_len = len;
 	ms.ms_output = output;
 	status = sgx_ecall(eid, 3, &ocall_table_Enclave, &ms);

@@ -2,55 +2,51 @@
 #ifndef _APP_H_
 #define _APP_H_
 
+#include <stddef.h> /* for size_t */
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
-int tee_init(const char* enclave_filename);
+int tee_init(const char* enclave_path);
 void tee_destroy();
 
+// Phase 2
 void tee_prepare_gradient(
-    int client_id,
-    long proj_seed, 
-    float* w_new, 
-    float* w_old, 
-    int model_len, 
-    int* ranges, 
-    int ranges_len, 
-    float* output_proj, 
-    int out_len
-);
-
-void tee_generate_masked_gradient_dynamic(
-    long seed_mask_root, 
-    long seed_global_0, 
     int client_id, 
-    int* active_ids, 
-    int active_len, 
-    float k_weight, 
-    int model_len, 
-    int* ranges, 
-    int ranges_len, 
-    long long* output, 
-    int out_len
+    const char* proj_seed_str,  // [修改] 接收字符串
+    float* w_new, float* w_old, size_t model_len, 
+    int* ranges, size_t ranges_len, float* output_proj, size_t out_len
 );
 
+// Phase 4
+void tee_generate_masked_gradient_dynamic(
+    const char* seed_mask_root_str, // [修改] 接收字符串
+    const char* seed_global_0_str,  // [修改]
+    int client_id, 
+    int* active_ids, size_t active_count,
+    const char* k_weight_str,       // [修改]
+    size_t model_len, 
+    int* ranges, size_t ranges_len, 
+    long long* output, size_t out_len
+);
+
+// Phase 5
 void tee_get_vector_shares_dynamic(
-    long seed_sss, 
-    long seed_mask_root, 
-    int* u1_ids, 
-    int u1_len, 
-    int* u2_ids, 
-    int u2_len, 
+    const char* seed_sss_str,       // [修改]
+    const char* seed_mask_root_str, // [修改]
+    int* u1_ids, size_t u1_len, 
+    int* u2_ids, size_t u2_len, 
     int my_client_id, 
     int threshold, 
     long long* output_vector, 
-    int out_max_len
+    size_t out_max_len
 );
 
+// Noise
 void tee_generate_noise_from_seed(
-    long seed, 
-    int len, 
+    const char* seed_str,           // [修改]
+    size_t len, 
     long long* output
 );
 
@@ -58,4 +54,4 @@ void tee_generate_noise_from_seed(
 }
 #endif
 
-#endif
+#endif /* !_APP_H_ */

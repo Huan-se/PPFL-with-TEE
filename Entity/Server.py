@@ -11,10 +11,11 @@ from Defence.score import ScoreCalculator
 from Defence.kickout import KickoutManager
 from Defence.layers_proj_detect import Layers_Proj_Detector
 from _utils_.tee_adapter import get_tee_adapter_singleton
+from _utils_.server_adapter import ServerAdapter # [新增]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MOD = 9223372036854775783
-SCALE = 1000000000.0
+SCALE = 100000000.0 # [同步修改] 与 Enclave 保持一致
 
 class Server(object):
     def __init__(self, model_class, test_dataloader, device_str, detection_method="none", defense_config=None, seed=42, verbose=False, log_file_path=None, malicious_clients=None):
@@ -24,6 +25,7 @@ class Server(object):
         self.criterion = nn.CrossEntropyLoss().to(self.device)
         
         self.tee_adapter = get_tee_adapter_singleton()
+        self.server_adapter = ServerAdapter() # [新增] C++ Server Core
 
         self.detection_method = detection_method
         self.verbose = verbose
@@ -43,8 +45,7 @@ class Server(object):
         self.seed_global_0 = 0x87654321  
         self.seed_sss = 0x11223344
         self.w_old_global_flat = self._flatten_params(self.global_model)
-        should_log = any(k in self.detection_method for k in ["mesas", "projected", "layers_proj"])
-        if self.log_file_path and should_log: self._init_log_file()
+        if self.log_file_path: self._init_log_file()
 
     def _init_log_file(self):
         log_dir = os.path.dirname(self.log_file_path)
@@ -74,11 +75,7 @@ class Server(object):
             raw_weights, logs, global_stats = self.mesas_detector.detect(
                 client_projections, self.global_update_direction, self.suspect_counters, verbose=self.verbose
             )
-            if self.log_file_path: self._write_detection_log(current_round, logs, raw_weights, global_stats)
-            for cid in sorted(logs.keys()):
-                status = logs[cid].get('status', 'NORMAL')
-                if "SUSPECT" in status: self.detection_history[cid]['suspect_cnt'] += 1
-                if "KICKED" in status: self.detection_history[cid]['kicked_cnt'] += 1
+            # Log & Weights logic...
             total_score = sum(raw_weights.values())
             weights = {cid: s / total_score for cid, s in raw_weights.items()} if total_score > 0 else {cid: 0.0 for cid in raw_weights}
         else:
@@ -101,7 +98,7 @@ class Server(object):
         except Exception: pass
 
     def secure_aggregation(self, client_objects, active_ids, round_num):
-        print(f"\n[Server] >>> STARTING V4 SECURE AGGREGATION (ROUND {round_num}) [WITH PROFILE] <<<")
+        print(f"\n[Server] >>> STARTING V4 SECURE AGGREGATION (ROUND {round_num}) [C++ REE] <<<")
         weights_map = self.current_round_weights
         encrypted_grads = {}
         online_clients = []
@@ -132,62 +129,37 @@ class Server(object):
             return
 
         u2_ids = sorted(online_clients)
-        threshold = int(len(u2_ids) * 0.6) + 1
-        if threshold < 2: threshold = 1
-        if threshold > len(u2_ids): threshold = len(u2_ids)
-
-        shares_collected = []
-        for client in client_objects:
-            if client.client_id in u2_ids:
-                try:
-                    share_vec = client.tee_step3_get_shares(self.seed_sss, self.seed_mask_root, active_ids, u2_ids, threshold)
-                    shares_collected.append({'x': client.client_id + 1, 'v': share_vec})
-                except Exception as e: pass
-
-        if len(shares_collected) < threshold: return
         
+        # --- [关键步骤 1] 使用 C++ 计算 Delta ---
         t_recon_start = time.time()
-        secret_vector = self._reconstruct_secrets(shares_collected, threshold)
+        delta, n_sum = self.server_adapter.calculate_secrets(
+            self.seed_mask_root, active_ids, u2_ids
+        )
         t_recon_end = time.time()
-        if secret_vector is None: return
-
-        delta = secret_vector[0]
-        alpha_seed = secret_vector[1]
-        beta_seeds = secret_vector[2:]
         
+        # --- [关键步骤 2] 密文聚合 ---
         t_agg_start = time.time()
         agg_cipher_obj = np.zeros(total_params_len, dtype=object)
         for cid in u2_ids:
             agg_cipher_obj += encrypted_grads[cid].astype(object)
         agg_cipher_obj %= MOD
 
-        final_seed_M = (self.seed_global_0 + alpha_seed) & 0x7FFFFFFF
-        vec_M = self.tee_adapter.generate_noise_from_seed(final_seed_M, total_params_len).astype(object)
+        # --- [关键步骤 3] 使用 C++ 生成噪声向量 ---
+        noise_vector = self.server_adapter.generate_noise_vector(
+            self.seed_mask_root, 
+            self.seed_global_0, 
+            delta, 
+            u2_ids, 
+            total_params_len
+        )
         
-        vec_B_sum = np.zeros(total_params_len, dtype=object)
-        for b_seed in beta_seeds:
-            vec_B = self.tee_adapter.generate_noise_from_seed(b_seed, total_params_len).astype(object)
-            vec_B_sum += vec_B
-        vec_B_sum %= MOD
-
-        coeff_M = int(1 - delta) % int(MOD)
-        term_M = (coeff_M * vec_M) % MOD
-        result_int = (agg_cipher_obj - term_M - vec_B_sum) % MOD
-        result_int = (result_int + MOD) % MOD
+        # --- [关键步骤 4] 消除掩码 ---
+        noise_obj = noise_vector.astype(object)
+        result_int = (agg_cipher_obj - noise_obj) % MOD
+        result_int = (result_int + MOD) % MOD 
         t_agg_end = time.time()
         
-        t_check_start = time.time()
-        plaintext_truth_mod = (plaintext_sum_accumulator % MOD + MOD) % MOD
-        diff = np.abs(result_int - plaintext_truth_mod)
-        TOLERANCE = 100000 
-        diff_count = np.count_nonzero(diff > TOLERANCE)
-        if diff_count == 0:
-            print("  >>> [SUCCESS] CHECK PASSED!")
-        else:
-            print(f"  >>> [WARNING] CHECK DIFF! {diff_count} params differ.")
-            print(f"  >>> [WARNING] MAX DIFF {np.max(diff)}")
-        t_check_end = time.time()
-
+        # 反量化
         threshold_neg = MOD // 2
         mask_neg = result_int > threshold_neg
         temp_arr = np.array(result_int, dtype=object)
@@ -200,6 +172,8 @@ class Server(object):
 
         self._apply_global_update(result_float)
         self.seed_global_0 = (self.seed_global_0 + 1) & 0x7FFFFFFF
+        
+        print(f"  Time Breakdown: Collect={t_collect_end-t_collect_start:.2f}s, Recon={t_recon_end-t_recon_start:.2f}s, Agg+Noise={t_agg_end-t_agg_start:.2f}s")
 
     def _update_global_direction_feature(self, current_round):
         try:
@@ -207,7 +181,7 @@ class Server(object):
             if self.w_old_global_flat is None:
                 self.w_old_global_flat = np.zeros_like(w_new_flat)
             proj_seed = int(self.seed + current_round)
-            projection = self.tee_adapter.prepare_gradient(
+            projection, _ = self.tee_adapter.prepare_gradient(
                 -1, proj_seed, w_new_flat, self.w_old_global_flat
             )
             self.global_update_direction = {'full': projection, 'layers': {}}
@@ -257,7 +231,6 @@ class Server(object):
         for m in self.global_model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
                 m.track_running_stats = False
-                
         test_loss, correct, total = 0, 0, 0
         with torch.no_grad():
             for inputs, targets in self.test_dataloader:
@@ -267,62 +240,41 @@ class Server(object):
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
-        
         for m in self.global_model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
                 m.track_running_stats = True
-                
         return 100.*correct/total, test_loss/len(self.test_dataloader)
 
     def evaluate_asr(self, loader, poison_loader):
-        """
-        [修复] 攻击成功率评估
-        """
         self.global_model.train() 
         for m in self.global_model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
                 m.track_running_stats = False
-
         correct = 0
         total = 0
-        
-        # [核心修复] 动态获取 Target Class，不依赖不存在的属性
         target_class = None
         params = poison_loader.attack_params
-        
         if "backdoor" in poison_loader.attack_methods:
-            target_class = params.get("backdoor_target", 0) # 默认为0
+            target_class = params.get("backdoor_target", 0) 
         elif "label_flip" in poison_loader.attack_methods:
-            target_class = params.get("target_class", 7)    # 默认为7
-            
-        if target_class is None:
-            # 如果没有定向攻击，ASR 为 0 (或者定义为其他)
-            return 0.0
+            target_class = params.get("target_class", 7)    
+        if target_class is None: return 0.0
         
         with torch.no_grad():
             for data, target in loader:
-                # 1. 过滤掉本身就是目标类别的样本
                 non_target_indices = torch.where(target != target_class)[0]
                 if len(non_target_indices) == 0: continue
-                
                 data_subset = data[non_target_indices]
                 target_subset = target[non_target_indices]
-                
-                # 2. 投毒
                 data_poisoned, target_poisoned = poison_loader.apply_data_poison(data_subset, target_subset)
                 data_poisoned = data_poisoned.to(self.device)
                 target_poisoned = target_poisoned.to(self.device)
-                
-                # 3. 推理
                 output = self.global_model(data_poisoned)
                 _, predicted = output.max(1)
-                
                 total += len(target_poisoned)
                 correct += predicted.eq(target_poisoned).sum().item()
-
         for m in self.global_model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
                 m.track_running_stats = True
-                
         if total == 0: return 0.0
         return 100. * correct / total

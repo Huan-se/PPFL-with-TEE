@@ -50,6 +50,7 @@ class PoisonLoader:
                 output = model(data)
                 loss = criterion(output, target)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 optimizer.step()
                 
                 # 打印日志

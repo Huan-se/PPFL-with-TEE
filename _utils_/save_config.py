@@ -8,6 +8,10 @@ def get_result_filename(mode_name, model_type, dataset_type, detection_method, c
     生成具有可读性的唯一结果文件名
     """
     attacks = config.get('attack_types', [])
+    # 兼容 active_attacks 字段
+    if not attacks:
+        attacks = config.get('active_attacks', [])
+
     if isinstance(attacks, list):
         if not attacks or config.get('poison_ratio', 0) == 0:
             attack_str = "NoAttack"
@@ -27,9 +31,9 @@ def get_result_filename(mode_name, model_type, dataset_type, detection_method, c
     else:
         dist_str = "IID"
 
-    # [修改] 增加维度信息到文件名（如果存在），避免不同维度的矩阵结果混淆
+    # 增加维度信息到文件名（如果存在），避免不同维度的矩阵结果混淆
     proj_dim = config.get('defense', {}).get('projection_dim', 1024) if 'defense' in config else 1024
-    if "mesas" in detection_method or "projected" in detection_method:
+    if "mesas" in detection_method or "projected" in detection_method or "layers_proj" in detection_method:
         dim_str = f"_dim{proj_dim}"
     else:
         dim_str = ""
@@ -47,24 +51,32 @@ def check_result_exists(save_dir, mode_name, model_type, dataset_type, detection
     if os.path.exists(filepath):
         print(f"✅ [Skip] 结果已存在: {filename}")
         try:
-            data = np.load(filepath)
-            # [修改] 返回整个 data 对象，以便提取 asr_history
+            data = np.load(filepath, allow_pickle=True)
             return True, data
         except Exception as e:
             print(f"⚠️ 文件存在但读取失败 ({e})，将重新训练。")
             return False, None
     return False, None
 
-def save_result_with_config(save_dir, mode_name, model_type, dataset_type, detection_method, config, accuracy_history, asr_history=None):
-    """保存结果(.npz)和配置(.json)，新增 asr_history 支持"""
+def save_result_with_config(save_dir, mode_name, model_type, dataset_type, detection_method, config, accuracy_history, asr_history=None, loss_history=None):
+    """
+    保存结果(.npz)和配置(.json)
+    [适配] 新增 loss_history 参数，用于记录训练过程中的 Loss 变化
+    """
     os.makedirs(save_dir, exist_ok=True)
     filename = get_result_filename(mode_name, model_type, dataset_type, detection_method, config)
     filepath = os.path.join(save_dir, filename)
     
-    # [修改] 保存 asr_history
+    # 构建保存字典
     save_dict = {'accuracy_history': accuracy_history}
+    
+    # 保存 ASR
     if asr_history is not None and len(asr_history) > 0:
         save_dict['asr_history'] = asr_history
+    
+    # [修改] 保存 Loss
+    if loss_history is not None and len(loss_history) > 0:
+        save_dict['loss_history'] = loss_history
         
     np.savez(filepath, **save_dict)
     
@@ -72,6 +84,7 @@ def save_result_with_config(save_dir, mode_name, model_type, dataset_type, detec
     
     def convert(o):
         if isinstance(o, np.generic): return o.item()
+        if isinstance(o, set): return list(o) # 增加对 set 类型的支持
         raise TypeError
         
     with open(config_file, 'w') as f:
@@ -122,7 +135,7 @@ def plot_comparison_curves(config=None, result_dir="results", save_path="compari
                     break
             
             if mode:
-                data = np.load(os.path.join(result_dir, file))
+                data = np.load(os.path.join(result_dir, file), allow_pickle=True)
                 acc_hist = data['accuracy_history']
                 rounds = np.arange(1, len(acc_hist) + 1)
                 
@@ -135,11 +148,6 @@ def plot_comparison_curves(config=None, result_dir="results", save_path="compari
                          label=f"{style['label']} (Final Acc: {acc_hist[-1]:.1f}%)",
                          linewidth=2 if mode == 'poison_with_detection' else 1.5)
                 
-                # [新增] 如果有 ASR，也可以选择画出来 (这里暂不画，避免图太乱，只在 label 中体现或另画图)
-                if 'asr_history' in data:
-                     final_asr = data['asr_history'][-1]
-                     # print(f"  > {file} has ASR: {final_asr:.2f}%")
-                     
                 has_data = True
                 
         except Exception as e:

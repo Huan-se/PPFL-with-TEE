@@ -56,7 +56,7 @@ class Client(object):
         )
         
         run_epochs = epochs if epochs is not None else self.local_epochs
-
+        epoch_grad_norms = []
         # [修改] 优先使用 PoisonLoader 接管训练
         # 检查是否为恶意客户端且有攻击方法
         if self.poison_loader and self.poison_loader.attack_methods:
@@ -83,18 +83,49 @@ class Client(object):
             self.model.load_state_dict(new_state_dict)
             
         else:
-            # 标准训练流程 (Benign Client)
             criterion = nn.CrossEntropyLoss()
             for epoch in range(run_epochs):
+                batch_norms = []
                 for batch_idx, (data, target) in enumerate(self.train_loader):
                     data, target = data.to(self.device), target.to(self.device)
                     optimizer.zero_grad()
                     output = self.model(data)
                     loss = criterion(output, target)
+                    
+                    # [检查] Loss 是否为 NaN
+                    if torch.isnan(loss):
+                        print(f"  [Error] Client {self.client_id} Loss is NaN at Epoch {epoch} Batch {batch_idx}!")
+                        continue
+
                     loss.backward()
+                    
+                    # [关键调试] 计算梯度范数 (在裁剪之前)
+                    total_norm = 0.0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+                    batch_norms.append(total_norm)
+
+                    # [防御] 梯度裁剪 (Clip)
+                    # 建议将阈值设为 10.0 或更小
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                    
                     optimizer.step()
-        
+                
+                # 记录本 Epoch 平均梯度范数
+                avg_norm = sum(batch_norms) / len(batch_norms) if batch_norms else 0
+                epoch_grad_norms.append(avg_norm)
+
         t_end = time.time()
+        
+        # [调试输出] 如果梯度异常大，打印出来
+        if epoch_grad_norms:
+            max_norm = max(epoch_grad_norms)
+            if max_norm > 20.0 or self.verbose: # 阈值可调
+                print(f"  [Client {self.client_id}] Max Grad Norm: {max_norm:.4f}, local train err")
+
         return t_end - t_start
 
     def phase2_tee_process(self, proj_seed):

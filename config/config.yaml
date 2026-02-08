@@ -51,7 +51,7 @@ params:
     
     # 评分参数
     base_good_score: 1.0     # [修改] 配合代码逻辑，基础分通常设为 1.0
-    suspect_score: 1.0       # 疑似分固定为 1.0
+    suspect_score: 0.01       # 疑似分固定为 1.0
     max_bonus: 100.0       # 奖励分
     strike_threshold: 33
 
