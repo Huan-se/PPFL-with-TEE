@@ -113,28 +113,30 @@ class Client(object):
         data_size = len(self.train_loader.dataset) if hasattr(self.train_loader, 'dataset') else 1000
         return {'full': output}, data_size
 
-    def tee_step2_upload(self, w, active_ids, seed_mask_root, seed_global_0, seed_sss):
+    def tee_step1_encrypt(self, w, active_ids, seed_mask_root, seed_global_0):
+        """Phase A: 仅生成加密梯度 (Cipher)"""
         w_new_flat = self._flatten_params(self.model)
         model_len = len(w_new_flat)
         if self.ranges is None: self.ranges = np.array([0, model_len], dtype=np.int32)
         
-        # 1. 生成密文
+        # 调用 TEE 生成密文
         c_grad = self.tee_adapter.generate_masked_gradient_dynamic(
             seed_mask_root, seed_global_0, self.client_id, active_ids, 
             w, model_len
         )
+        return c_grad
+
+    def tee_step2_generate_shares(self, seed_sss, seed_mask_root, u1_ids, u2_ids):
+        """Phase B: 根据服务器广播的在线列表 (U2) 生成 Shares"""
+        # u1_ids: 本轮计划参与者 (active_ids)
+        # u2_ids: 实际在线者 (Online Users)
         
-        # 2. 生成向量 Share
-        # 向量长度 = 2 (Delta, Alpha) + len(active_ids) (Betas)
-        # u1_ids = active_ids (全量用户)
-        # u2_ids = active_ids (本地视角假设全员在线，用于生成 Delta)
-        vec_len = 2 + len(active_ids)
-        threshold = len(active_ids) // 2 + 1
+        threshold = len(u1_ids) // 2 + 1
         
+        # 调用 TEE 生成 Shares，传入真实的 U2，从而正确计算 Delta
         shares = self.tee_adapter.get_vector_shares_dynamic(
             seed_sss, seed_mask_root, 
-            active_ids, active_ids, 
+            u1_ids, u2_ids, 
             self.client_id, threshold
         )
-        # 此时 shares 是一个长度为 vec_len 的数组
-        return c_grad, shares
+        return shares

@@ -98,85 +98,140 @@ class Server(object):
         except Exception: pass
 
     def secure_aggregation(self, client_objects, active_ids, round_num):
-        print(f"\n[Server] >>> STARTING V4 SECURE AGGREGATION (ROUND {round_num}) [C++ REE Lagrange] <<<")
+        # [计时] 总开始时间
+        t_start_total = time.time()
+        
+        print(f"\n[Server] >>> STARTING V5 SECURE AGGREGATION (ROUND {round_num}) [Strict Demo] <<<")
         weights_map = self.current_round_weights
+        sorted_active_ids = sorted(active_ids) # U1: 计划参与者
+
+        # ==========================================
+        # Step 1: 第一次握手 - 收集密文，确认在线名单 (U2)
+        # ==========================================
+        t_s1_start = time.time()
+        print(f"  [Step 1] Broadcasting request & Collecting Ciphers...")
         
-        # [CRITICAL FIX] 强制排序 active_ids
-        # 确保所有 Client 看到的 U1 列表顺序完全一致，从而构建一致的 Secret 向量 S
-        sorted_active_ids = sorted(active_ids)
-        
-        # 1. 收集阶段 (Collect)
-        online_cids = []
-        ciphers_list = []
-        shares_delta_list = []
-        
-        t_collect_start = time.time()
+        u2_cids = []
+        cipher_map = {} 
         
         for client in client_objects:
+            # 仅处理本轮活跃的客户端
             if client.client_id not in sorted_active_ids: continue
+            
+            # 权重检查 (忽略权重极小的客户端)
             w = weights_map.get(client.client_id, 0.0)
             if w <= 1e-9: continue
             
             try:
-                # Client 上传: (Cipher, Shares)
-                # 使用 sorted_active_ids
-                c_grad, shares = client.tee_step2_upload(
-                    w, sorted_active_ids, 
-                    self.seed_mask_root, self.seed_global_0, self.seed_sss
-                )
-                
-                online_cids.append(client.client_id)
-                ciphers_list.append(c_grad)
-                shares_delta_list.append(shares)
-                
+                # Client: Phase A - 仅上传密文
+                # 该操作包括 TEE 内梯度加掩码
+                c_grad = client.tee_step1_encrypt(w, sorted_active_ids, 
+                                                self.seed_mask_root, self.seed_global_0)
+                u2_cids.append(client.client_id)
+                cipher_map[client.client_id] = c_grad
             except Exception as e:
-                print(f"  [Warning] Upload failed for Client {client.client_id}: {e}")
-        
-        t_collect_end = time.time()
+                print(f"    [Drop] Client {client.client_id} failed to upload cipher: {e}")
 
-        if not online_cids:
-            print("  [Error] No clients uploaded gradients.")
+        u2_ids = sorted(u2_cids) # U2: 实际在线者 (Commitment)
+        
+        t_s1_end = time.time()
+        print(f"  [Server] Confirmed Online Users (U2): {len(u2_ids)}/{len(sorted_active_ids)}")
+        
+        # 阈值检查
+        threshold = len(sorted_active_ids) // 2 + 1
+        if len(u2_ids) < threshold:
+            print(f"  [Abort] Not enough clients! Need {threshold}, got {len(u2_ids)}.")
             return
 
-        # 2. 排序 (Sorting)
-        # 确保 Server 端处理的 U2 也是有序的
-        combined = sorted(zip(online_cids, shares_delta_list, ciphers_list), key=lambda x: x[0])
-        u2_ids = [x[0] for x in combined]
-        sorted_shares = [x[1] for x in combined]
-        sorted_ciphers = [x[2] for x in combined]
+        # ==========================================
+        # Step 2: 第二次握手 - 广播 U2，收集 Shares
+        # ==========================================
+        t_s2_start = time.time()
+        print(f"  [Step 2] Broadcasting U2 & Collecting Shares...")
+        
+        shares_list = []
+        final_ciphers = []
 
-        print(f"  [Server] Collecting {len(u2_ids)} clients. Starting Aggregation...")
+        # 严格遍历 U2 列表，确保顺序一致
+        for cid in u2_ids:
+            # 模拟网络发送：找到对应的 Client 对象
+            client = next(c for c in client_objects if c.client_id == cid)
+            
+            try:
+                # Client: Phase B - 根据确定的 U2 计算 Delta 并生成 Share
+                shares = client.tee_step2_generate_shares(
+                    self.seed_sss, self.seed_mask_root,
+                    sorted_active_ids, # U1 (用于确定向量长度)
+                    u2_ids             # U2 (用于计算 Delta 和插值)
+                )
+                shares_list.append(shares)
+                final_ciphers.append(cipher_map[cid])
+            except Exception as e:
+                 print(f"    [Error] Client {cid} dropped during Share generation: {e}")
+                 # 这里不进行处理，由下方的长度检查触发 Abort
 
-        # 3. 聚合阶段 (Aggregation & Unmasking in C++)
+        # [关键逻辑] 原子性检查
+        # 如果有人在 Step 2 掉线，剩余人的 Delta 计算将基于错误的 U2 假设，因此必须终止。
+        if len(shares_list) != len(u2_ids):
+            print(f"  [Abort] Consistency Broken! U2 size={len(u2_ids)}, Shares received={len(shares_list)}.")
+            print(f"          (A client dropped after U2 commitment, invalidating the math.)")
+            return
+
+        t_s2_end = time.time()
+
+        # ==========================================
+        # Step 3: C++ 核心聚合 (ServerCore)
+        # ==========================================
         t_agg_start = time.time()
+        print("  [Step 3] Executing ServerCore Aggregation...")
         
-        result_int = self.server_adapter.aggregate_and_unmask(
-            self.seed_mask_root,
-            self.seed_global_0,
-            sorted_active_ids, # [FIX] 传入排序后的 U1
-            u2_ids,            # U2
-            sorted_shares,     # Share 矩阵
-            sorted_ciphers     # 密文矩阵
-        )
-        
+        try:
+            # 调用 C++ 动态库进行插值恢复与去噪
+            result_int = self.server_adapter.aggregate_and_unmask(
+                self.seed_mask_root,
+                self.seed_global_0,
+                sorted_active_ids, # U1: 用于映射 Beta 种子
+                u2_ids,            # U2: 用于拉格朗日插值坐标
+                shares_list,       # 份额矩阵
+                final_ciphers      # 密文矩阵
+            )
+            
+            # 反量化与更新全局模型
+            threshold_neg = MOD // 2
+            result_float = result_int.astype(np.float64)
+            # 处理负数 (模域 -> 实数域)
+            mask_neg = result_int > threshold_neg
+            result_float[mask_neg] -= float(MOD)
+            # 除以缩放因子
+            result_float /= SCALE
+            
+            # 应用梯度更新
+            self._apply_global_update(result_float)
+            
+            # 更新全局种子 (防止重放)
+            self.seed_global_0 = (self.seed_global_0 + 1) & 0x7FFFFFFF
+            print("  [Success] Aggregation Completed.")
+            
+        except Exception as e:
+            print(f"  [Critical Error] Aggregation crashed: {e}")
+            import traceback
+            traceback.print_exc()
+
         t_agg_end = time.time()
-
-        # 4. 反量化与更新
-        threshold_neg = MOD // 2
-        result_float = result_int.astype(np.float64)
-        mask_neg = result_int > threshold_neg
-        result_float[mask_neg] -= float(MOD) 
         
-        result_float /= SCALE
+        # ==========================================
+        # 性能统计输出
+        # ==========================================
+        t_step1 = t_s1_end - t_s1_start
+        t_step2 = t_s2_end - t_s2_start
+        t_core = t_agg_end - t_agg_start
+        t_total = t_agg_end - t_start_total
         
-        if np.isnan(result_float).any() or np.isinf(result_float).any():
-            print("\n  [CRITICAL ERROR] NaN or Inf detected in aggregated result!")
-            return 
-
-        self._apply_global_update(result_float)
-        self.seed_global_0 = (self.seed_global_0 + 1) & 0x7FFFFFFF
-        
-        print(f"  Time Breakdown: Collect={t_collect_end-t_collect_start:.2f}s, C++ Agg={t_agg_end-t_agg_start:.2f}s")
+        print(f"  [Perf] Time Breakdown:")
+        print(f"         Step 1 (Cipher Upload) : {t_step1:.4f}s")
+        print(f"         Step 2 (Share Upload)  : {t_step2:.4f}s")
+        print(f"         Step 3 (C++ Aggregation): {t_core:.4f}s")
+        print(f"         Total Round Time       : {t_total:.4f}s")
 
     def _update_global_direction_feature(self, current_round):
         try:
