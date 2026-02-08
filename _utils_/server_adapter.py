@@ -13,62 +13,70 @@ class ServerAdapter:
 
         self.lib = ctypes.CDLL(lib_path)
         
-        # Calc Secrets
-        self.lib.server_core_calc_secrets.argtypes = [
-            ctypes.c_char_p, # seed_mask_root_str
-            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int, # u1
-            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int, # u2
-            ctypes.c_char_p, # out_delta_str
-            ctypes.c_char_p, # out_n_sum_str
-            ctypes.c_size_t  # buffer_len
-        ]
-        
-        # Gen Noise
-        self.lib.server_core_gen_noise_vector.argtypes = [
-            ctypes.c_char_p, # seed_root
-            ctypes.c_char_p, # seed_g0
-            ctypes.c_char_p, # delta
-            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int, # u2
-            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS'), # output noise
-            ctypes.c_int   # len
+        # 配置 C++ 接口参数类型
+        # void server_core_aggregate_and_unmask(
+        #     const char* seed_root, const char* seed_g0, 
+        #     int* u1, int l1, int* u2, int l2, 
+        #     long* shares, int vec_len, 
+        #     long* ciphers, int data_len, 
+        #     long* output
+        # )
+        self.lib.server_core_aggregate_and_unmask.argtypes = [
+            ctypes.c_char_p, # seed_mask_root
+            ctypes.c_char_p, # seed_global_0
+            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int, # u1_ids
+            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int, # u2_ids
+            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS'), # shares_flat
+            ctypes.c_int, # vector_len
+            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS'), # ciphers_flat
+            ctypes.c_int, # data_len
+            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS')  # output_result
         ]
 
+    # [关键修复] 补全缺失的辅助函数
     def _to_bytes(self, val):
         return str(val).encode('utf-8')
 
-    def calculate_secrets(self, seed_mask_root, u1_ids, u2_ids):
+    def aggregate_and_unmask(self, seed_mask_root, seed_global_0, u1_ids, u2_ids, shares_list, cipher_list):
+        """
+        一站式安全聚合：
+        1. 批量恢复 Secret 向量 (Delta, Alpha, Beta...)
+        2. 生成 Noise
+        3. 聚合并消去
+        """
+        # 确保输入数据非空
+        if not cipher_list or not shares_list:
+            raise ValueError("Cipher list or Shares list is empty!")
+
+        data_len = len(cipher_list[0])
+        vector_len = len(shares_list[0]) # 每个 Client 的 Share 向量长度
+        num_u1 = len(u1_ids)
+        num_u2 = len(u2_ids)
+        
         arr_u1 = np.array(u1_ids, dtype=np.int32)
         arr_u2 = np.array(u2_ids, dtype=np.int32)
         
-        buf_len = 64
-        d_buf = ctypes.create_string_buffer(buf_len)
-        n_buf = ctypes.create_string_buffer(buf_len)
+        # 展平 Shares: [Client1_Vec, Client2_Vec...] -> 1D Array
+        # shares_list 是一个 list of lists/arrays，vstack 将其堆叠为矩阵，再 reshape 展平
+        flat_shares = np.vstack(shares_list).reshape(-1).astype(np.int64)
         
-        self.lib.server_core_calc_secrets(
-            self._to_bytes(seed_mask_root),
-            arr_u1, len(arr_u1),
-            arr_u2, len(arr_u2),
-            d_buf,
-            n_buf,
-            buf_len
-        )
-        try:
-            delta = int(d_buf.value.decode('utf-8'))
-            n_sum = int(n_buf.value.decode('utf-8'))
-            return delta, n_sum
-        except ValueError:
-            return 0, 0
-
-    def generate_noise_vector(self, seed_mask_root, seed_global_0, delta, u2_ids, data_len):
-        arr_u2 = np.array(u2_ids, dtype=np.int32)
-        out_noise = np.zeros(data_len, dtype=np.int64)
+        # 展平 Ciphers
+        flat_ciphers = np.vstack(cipher_list).reshape(-1).astype(np.int64)
         
-        self.lib.server_core_gen_noise_vector(
+        # 准备输出缓冲区
+        out_result = np.zeros(data_len, dtype=np.int64)
+        
+        # 调用 C++
+        self.lib.server_core_aggregate_and_unmask(
             self._to_bytes(seed_mask_root),
             self._to_bytes(seed_global_0),
-            self._to_bytes(delta),
-            arr_u2, len(arr_u2),
-            out_noise,
-            data_len
+            arr_u1, num_u1,
+            arr_u2, num_u2,
+            flat_shares,
+            vector_len,
+            flat_ciphers,
+            data_len,
+            out_result
         )
-        return out_noise
+        
+        return out_result

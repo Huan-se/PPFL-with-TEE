@@ -98,82 +98,85 @@ class Server(object):
         except Exception: pass
 
     def secure_aggregation(self, client_objects, active_ids, round_num):
-        print(f"\n[Server] >>> STARTING V4 SECURE AGGREGATION (ROUND {round_num}) [C++ REE] <<<")
+        print(f"\n[Server] >>> STARTING V4 SECURE AGGREGATION (ROUND {round_num}) [C++ REE Lagrange] <<<")
         weights_map = self.current_round_weights
-        encrypted_grads = {}
-        online_clients = []
-        total_params_len = sum(p.numel() for p in self.global_model.parameters())
-
+        
+        # [CRITICAL FIX] 强制排序 active_ids
+        # 确保所有 Client 看到的 U1 列表顺序完全一致，从而构建一致的 Secret 向量 S
+        sorted_active_ids = sorted(active_ids)
+        
+        # 1. 收集阶段 (Collect)
+        online_cids = []
+        ciphers_list = []
+        shares_delta_list = []
+        
         t_collect_start = time.time()
-        plaintext_sum_accumulator = np.zeros(total_params_len, dtype=object)
         
         for client in client_objects:
-            if client.client_id not in active_ids: continue
+            if client.client_id not in sorted_active_ids: continue
             w = weights_map.get(client.client_id, 0.0)
             if w <= 1e-9: continue
+            
             try:
-                c_grad = client.tee_step2_upload(w, active_ids, self.seed_mask_root, self.seed_global_0)
-                encrypted_grads[client.client_id] = c_grad
-                online_clients.append(client.client_id)
-                # Debug Check
-                w_client_flat = self._flatten_params(client.model)
-                grad_flat = w_client_flat - self.w_old_global_flat
-                grad_quantized = (grad_flat * w * SCALE).astype(np.int64)
-                plaintext_sum_accumulator += grad_quantized.astype(object)
+                # Client 上传: (Cipher, Shares)
+                # 使用 sorted_active_ids
+                c_grad, shares = client.tee_step2_upload(
+                    w, sorted_active_ids, 
+                    self.seed_mask_root, self.seed_global_0, self.seed_sss
+                )
+                
+                online_cids.append(client.client_id)
+                ciphers_list.append(c_grad)
+                shares_delta_list.append(shares)
+                
             except Exception as e:
                 print(f"  [Warning] Upload failed for Client {client.client_id}: {e}")
         
         t_collect_end = time.time()
-        if not online_clients:
+
+        if not online_cids:
             print("  [Error] No clients uploaded gradients.")
             return
 
-        u2_ids = sorted(online_clients)
-        
-        # --- [关键步骤 1] 使用 C++ 计算 Delta ---
-        t_recon_start = time.time()
-        delta, n_sum = self.server_adapter.calculate_secrets(
-            self.seed_mask_root, active_ids, u2_ids
-        )
-        t_recon_end = time.time()
-        
-        # --- [关键步骤 2] 密文聚合 ---
-        t_agg_start = time.time()
-        agg_cipher_obj = np.zeros(total_params_len, dtype=object)
-        for cid in u2_ids:
-            agg_cipher_obj += encrypted_grads[cid].astype(object)
-        agg_cipher_obj %= MOD
+        # 2. 排序 (Sorting)
+        # 确保 Server 端处理的 U2 也是有序的
+        combined = sorted(zip(online_cids, shares_delta_list, ciphers_list), key=lambda x: x[0])
+        u2_ids = [x[0] for x in combined]
+        sorted_shares = [x[1] for x in combined]
+        sorted_ciphers = [x[2] for x in combined]
 
-        # --- [关键步骤 3] 使用 C++ 生成噪声向量 ---
-        noise_vector = self.server_adapter.generate_noise_vector(
-            self.seed_mask_root, 
-            self.seed_global_0, 
-            delta, 
-            u2_ids, 
-            total_params_len
+        print(f"  [Server] Collecting {len(u2_ids)} clients. Starting Aggregation...")
+
+        # 3. 聚合阶段 (Aggregation & Unmasking in C++)
+        t_agg_start = time.time()
+        
+        result_int = self.server_adapter.aggregate_and_unmask(
+            self.seed_mask_root,
+            self.seed_global_0,
+            sorted_active_ids, # [FIX] 传入排序后的 U1
+            u2_ids,            # U2
+            sorted_shares,     # Share 矩阵
+            sorted_ciphers     # 密文矩阵
         )
         
-        # --- [关键步骤 4] 消除掩码 ---
-        noise_obj = noise_vector.astype(object)
-        result_int = (agg_cipher_obj - noise_obj) % MOD
-        result_int = (result_int + MOD) % MOD 
         t_agg_end = time.time()
-        
-        # 反量化
+
+        # 4. 反量化与更新
         threshold_neg = MOD // 2
+        result_float = result_int.astype(np.float64)
         mask_neg = result_int > threshold_neg
-        temp_arr = np.array(result_int, dtype=object)
-        temp_arr[mask_neg] -= MOD 
-        result_float = temp_arr.astype(np.float32) / SCALE
+        result_float[mask_neg] -= float(MOD) 
+        
+        result_float /= SCALE
         
         if np.isnan(result_float).any() or np.isinf(result_float).any():
-            print("\n  [CRITICAL ERROR] NaN or Inf detected!")
+            print("\n  [CRITICAL ERROR] NaN or Inf detected in aggregated result!")
             return 
 
         self._apply_global_update(result_float)
         self.seed_global_0 = (self.seed_global_0 + 1) & 0x7FFFFFFF
         
-        print(f"  Time Breakdown: Collect={t_collect_end-t_collect_start:.2f}s, Recon={t_recon_end-t_recon_start:.2f}s, Agg+Noise={t_agg_end-t_agg_start:.2f}s")
+        print(f"  Time Breakdown: Collect={t_collect_end-t_collect_start:.2f}s, C++ Agg={t_agg_end-t_agg_start:.2f}s")
 
     def _update_global_direction_feature(self, current_round):
         try:

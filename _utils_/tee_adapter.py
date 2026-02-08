@@ -41,79 +41,41 @@ class TEEAdapter:
         self.lib.tee_init.restype = ctypes.c_int
         self.lib.tee_destroy.argtypes = []
         
-        # Prepare Gradient
-        try: func = self.lib.tee_prepare_gradient
-        except: func = self.lib.ecall_prepare_gradient
-        func.argtypes = [
+        # Phase 2: Prepare Gradient
+        # Signature: (int cid, char* seed, float* w_new, float* w_old, size_t len, int* ranges, size_t r_len, float* out, size_t out_len)
+        self.lib.tee_prepare_gradient.argtypes = [
             ctypes.c_int, 
-            ctypes.c_char_p, # proj_seed_str
+            ctypes.c_char_p,
             np.ctypeslib.ndpointer(dtype=np.float32, flags='C_CONTIGUOUS'),
             np.ctypeslib.ndpointer(dtype=np.float32, flags='C_CONTIGUOUS'),
-            ctypes.c_int,
+            ctypes.c_size_t,
             np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'),
-            ctypes.c_int,
+            ctypes.c_size_t,
             np.ctypeslib.ndpointer(dtype=np.float32, flags='C_CONTIGUOUS'),
-            ctypes.c_int
+            ctypes.c_size_t
         ]
-        self._func_prepare = func
 
-        # Generate Masked
-        try: func = self.lib.tee_generate_masked_gradient_dynamic
-        except: func = self.lib.ecall_generate_masked_gradient_dynamic
-        func.argtypes = [
-            ctypes.c_char_p, # seed_root
-            ctypes.c_char_p, # seed_g0
+        # Phase 4: Generate Masked Gradient
+        # Signature: (char* root, char* g0, int cid, int* aids, size_t alen, char* kw, size_t len, int* ranges, size_t rlen, long* out, size_t olen)
+        self.lib.tee_generate_masked_gradient_dynamic.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p,
             ctypes.c_int,
-            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int,
-            ctypes.c_char_p, # k_weight (float string)
-            ctypes.c_int,
-            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int,
-            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS'), ctypes.c_int
+            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_size_t,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_size_t,
+            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS'), ctypes.c_size_t
         ]
-        self._func_generate = func
 
-        # Get Shares
-        try: func = self.lib.tee_get_vector_shares_dynamic
-        except: func = self.lib.ecall_get_vector_shares_dynamic
-        func.argtypes = [
-            ctypes.c_char_p, # seed_sss
-            ctypes.c_char_p, # seed_root
-            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int,
-            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int,
+        # Phase 5: Get Shares
+        # Signature: (char* sss, char* root, int* u1, size_t l1, int* u2, size_t l2, int cid, int th, long* out, size_t max)
+        self.lib.tee_get_vector_shares_dynamic.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p,
+            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_size_t,
+            np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_size_t,
             ctypes.c_int, ctypes.c_int,
-            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS'), ctypes.c_int
+            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS'), ctypes.c_size_t
         ]
-        self._func_get_shares = func
-
-        # Noise Gen
-        try: func = self.lib.tee_generate_noise_from_seed
-        except: func = self.lib.ecall_generate_noise_from_seed
-        func.argtypes = [
-            ctypes.c_char_p, # seed
-            ctypes.c_int,
-            np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS')
-        ]
-        self._func_noise = func
-
-        # --- Server Core ---
-        try:
-            func = self.lib.tee_server_calculate_secrets
-            func.argtypes = [
-                ctypes.c_char_p,
-                np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int,
-                np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int,
-                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t
-            ]
-            self._func_server_calc = func
-            
-            func = self.lib.tee_server_gen_noise_vector
-            func.argtypes = [
-                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
-                np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS'), ctypes.c_int,
-                np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS'), ctypes.c_int
-            ]
-            self._func_server_noise = func
-        except: pass
 
     def initialize_enclave(self, enclave_path=None):
         if self.initialized: return
@@ -131,75 +93,65 @@ class TEEAdapter:
     # --- Wrappers ---
 
     def prepare_gradient(self, client_id, proj_seed, w_new, w_old, output_dim=1024):
+        """Phase 2: 计算梯度并投影，同时将梯度缓存于 TEE"""
         if not self.initialized: self.initialize_enclave()
         total_len = w_new.size
+        # 如果模型参数本身已经是 float32，直接用；否则强转
+        if w_new.dtype != np.float32: w_new = w_new.astype(np.float32)
+        if w_old.dtype != np.float32: w_old = w_old.astype(np.float32)
+        
         ranges = np.array([0, total_len], dtype=np.int32)
         output_proj = np.zeros(output_dim, dtype=np.float32)
-        self._func_prepare(
+        
+        self.lib.tee_prepare_gradient(
             client_id, 
-            self._to_bytes(proj_seed), # Str
-            w_new, w_old, total_len, ranges, len(ranges), output_proj, output_dim
+            self._to_bytes(proj_seed), 
+            w_new, w_old, total_len, 
+            ranges, len(ranges), 
+            output_proj, output_dim
         )
         return output_proj, ranges
 
-    def generate_masked_gradient_dynamic(self, seed_mask, seed_g0, cid, active_ids, k_weight, w_new, ranges, output_len):
+    def generate_masked_gradient_dynamic(self, seed_mask, seed_g0, cid, active_ids, k_weight, output_len):
+        """Phase 4: 生成加掩码的梯度 (无需传入 w_new, 使用 TEE 缓存)"""
         if not self.initialized: self.initialize_enclave()
+        
         model_len = output_len
-        if ranges is None: ranges = np.array([0, model_len], dtype=np.int32)
+        ranges = np.array([0, model_len], dtype=np.int32) # 默认全范围
         arr_active = np.array(active_ids, dtype=np.int32)
         out_buf = np.zeros(model_len, dtype=np.int64)
         
-        self._func_generate(
-            self._to_bytes(seed_mask), # Str
-            self._to_bytes(seed_g0),   # Str
+        self.lib.tee_generate_masked_gradient_dynamic(
+            self._to_bytes(seed_mask), 
+            self._to_bytes(seed_g0), 
             cid, 
             arr_active, len(arr_active), 
-            self._to_bytes(k_weight),  # Float -> Str
-            model_len, ranges, len(ranges), 
+            self._to_bytes(k_weight), 
+            model_len, 
+            ranges, len(ranges), 
             out_buf, model_len
         )
         return out_buf
 
     def get_vector_shares_dynamic(self, seed_sss, seed_mask, u1_ids, u2_ids, my_cid, threshold):
+        """Phase 5: 获取秘密分片 (Shares)"""
         if not self.initialized: self.initialize_enclave()
         arr_u1 = np.array(u1_ids, dtype=np.int32)
         arr_u2 = np.array(u2_ids, dtype=np.int32)
-        max_len = 2 + len(u2_ids) + 50
+        
+        # Share 0: Delta (Needs Reconstruction)
+        # Share 1: Alpha Seed (Needs Reconstruction)
+        # Share 2...N: Beta Seeds (For each online client)
+        # Buffer size: 2 + len(u2)
+        max_len = 2 + len(u2_ids)
         out_buf = np.zeros(max_len, dtype=np.int64)
         
-        self._func_get_shares(
-            self._to_bytes(seed_sss),  # Str
-            self._to_bytes(seed_mask), # Str
-            arr_u1, len(arr_u1), arr_u2, len(arr_u2), 
-            my_cid, threshold, out_buf, max_len
+        self.lib.tee_get_vector_shares_dynamic(
+            self._to_bytes(seed_sss), 
+            self._to_bytes(seed_mask), 
+            arr_u1, len(arr_u1), 
+            arr_u2, len(arr_u2), 
+            my_cid, threshold, 
+            out_buf, max_len
         )
-        return out_buf[:2 + len(u2_ids)]
-
-    # --- Server Side Wrappers ---
-    
-    def server_calculate_secrets(self, seed_mask_root, u1_ids, u2_ids):
-        arr_u1 = np.array(u1_ids, dtype=np.int32)
-        arr_u2 = np.array(u2_ids, dtype=np.int32)
-        buf_len = 64
-        d_buf = ctypes.create_string_buffer(buf_len)
-        n_buf = ctypes.create_string_buffer(buf_len)
-        
-        self._func_server_calc(
-            self._to_bytes(seed_mask_root),
-            arr_u1, len(arr_u1), arr_u2, len(arr_u2),
-            d_buf, n_buf, buf_len
-        )
-        return int(d_buf.value), int(n_buf.value)
-
-    def server_generate_noise_vector(self, seed_mask_root, seed_global_0, delta, u2_ids, data_len):
-        arr_u2 = np.array(u2_ids, dtype=np.int32)
-        out_noise = np.zeros(data_len, dtype=np.int64)
-        
-        self._func_server_noise(
-            self._to_bytes(seed_mask_root),
-            self._to_bytes(seed_global_0),
-            self._to_bytes(delta),
-            arr_u2, len(arr_u2),
-            out_noise, data_len
-        )
-        return out_noise
+        return out_buf
