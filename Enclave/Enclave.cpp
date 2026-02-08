@@ -38,10 +38,12 @@ int printf(const char *fmt, ...) {
 #include <cmath>
 #include <algorithm> 
 #include <mutex>
+#include <Eigen/Dense>
 
 // [关键修改] 使用 128 位整数
 typedef __int128_t int128;
 
+#define CHUNK_SIZE 4096
 const long long MOD = 9223372036854775783;
 const double SCALE = 100000000.0; 
 const uint64_t N_MASK = 0xFFFFFFFFFFFF; 
@@ -161,19 +163,62 @@ void ecall_prepare_gradient(
 ) {
     long proj_seed = parse_long(proj_seed_str);
     try {
+        // 1. 计算完整梯度
         std::vector<float> full_gradient;
         full_gradient.reserve(model_len);
         for(size_t i = 0; i < model_len; ++i) {
             full_gradient.push_back(w_new[i] - w_old[i]);
         }
+        
+        // 2. 缓存梯度
         {
             std::lock_guard<std::mutex> lock(g_map_mutex);
             g_gradient_buffer[client_id] = full_gradient;
         }
+
+        // 3. 流式投影 (V = P * G) - 使用 Eigen 加速
+        // 这里恢复了真正的流式投影逻辑：
+        // P 是通过 proj_seed 生成的随机高斯矩阵，
+        // 我们分块生成 P 的行，并与梯度做点积。
+        
         DeterministicRandom rng(proj_seed);
-        for(size_t i=0; i<out_len; ++i) output_proj[i] = rng.next_normal(); 
+        Eigen::VectorXf rng_chunk(CHUNK_SIZE);
+
+        for (size_t k = 0; k < out_len; ++k) {
+            float dot_product = 0.0f;
+            
+            for (size_t r = 0; r < ranges_len; r += 2) {
+                int start_idx = ranges[r];
+                int block_len = ranges[r+1];
+                if (start_idx < 0 || start_idx + block_len > (int)model_len) continue;
+                
+                int offset = 0;
+                while (offset < block_len) {
+                    int curr_size = std::min((int)CHUNK_SIZE, block_len - offset);
+                    
+                    // 生成 P 矩阵当前行的这一小段随机数
+                    for(int i=0; i<curr_size; ++i) {
+                        rng_chunk[i] = rng.next_normal();
+                    }
+                    
+                    // 计算点积
+                    Eigen::Map<Eigen::VectorXf> grad_segment(
+                        full_gradient.data() + start_idx + offset, 
+                        curr_size
+                    );
+                    dot_product += rng_chunk.head(curr_size).dot(grad_segment);
+                    
+                    offset += curr_size;
+                }
+            }
+            // 直接输出点积结果 (无二值化，保留原始投影)
+            output_proj[k] = dot_product;
+        }
+
     } catch (...) {
         printf("[Enclave Error] OOM or Exception in prepare_gradient!\n");
+        // 异常时清零输出，避免脏数据
+        for(size_t i=0; i<out_len; ++i) output_proj[i] = 0.0f;
     }
 }
 
