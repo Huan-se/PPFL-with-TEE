@@ -7,6 +7,15 @@
 #include <string.h>
 #include <stdarg.h>
 
+static int g_enclave_verbose = 0;
+
+#define LOG_DEBUG(fmt, ...) \
+    do { if (g_enclave_verbose) printf("[Enclave DEBUG] " fmt, ##__VA_ARGS__); } while (0)
+
+void ecall_set_verbose(int level) {
+    g_enclave_verbose = level;
+}
+
 // 1. 基础环境补丁
 extern "C" {
     int rand(void);
@@ -216,7 +225,7 @@ void ecall_prepare_gradient(
         }
 
     } catch (...) {
-        printf("[Enclave Error] OOM or Exception in prepare_gradient!\n");
+        LOG_DEBUG("[Enclave Error] OOM or Exception in prepare_gradient!\n");
         // 异常时清零输出，避免脏数据
         for(size_t i=0; i<out_len; ++i) output_proj[i] = 0.0f;
     }
@@ -230,11 +239,16 @@ void ecall_generate_masked_gradient_dynamic(
     long seed_mask_root = parse_long(seed_mask_root_str);
     long seed_global_0 = parse_long(seed_global_0_str);
     float k_weight = parse_float(k_weight_str);
+    if (client_id < 5) { // 限制打印数量，防止刷屏
+        LOG_DEBUG("[Enclave DEBUG] Client %d: Received k_weight_str='%s', Parsed k_weight=%.10f\n", 
+               client_id, k_weight_str, k_weight);
+    }
 
     std::vector<float> grad;
     try {
         std::lock_guard<std::mutex> lock(g_map_mutex);
         if (g_gradient_buffer.find(client_id) == g_gradient_buffer.end()) {
+            LOG_DEBUG("[Enclave ERROR] Client %d: Gradient buffer empty!\n", client_id);
             for(size_t i=0; i<out_len; ++i) output[i] = 0;
             return;
         }
@@ -276,6 +290,12 @@ void ecall_generate_masked_gradient_dynamic(
             long long G = (long long)(g * k_weight * SCALE);
             G = (G % MOD + MOD) % MOD;
             
+            // [Probe 2] 抽样打印计算过程 (仅前3个数据点)
+            if (client_id < 5 && cur < 3) {
+                LOG_DEBUG("[Enclave DEBUG] Client %d [Idx %lu]: Raw_g=%f, Weighted_g=%f, Quantized_G=%lld\n", 
+                       client_id, cur, g, g * k_weight, G);
+            }
+
             long long M = rng_M.next_mask_mod();
             long long B = rng_B.next_mask_mod();
             long long tM = MathUtils::safe_mod_mul(c_i, M);

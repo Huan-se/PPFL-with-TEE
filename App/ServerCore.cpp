@@ -12,18 +12,21 @@
 
 // [关键修改] 使用 128 位整数防止溢出
 typedef __int128_t int128;
-
 const long long MOD = 9223372036854775783;
-
+static int g_core_verbose = 0;
+#define LOG_DEBUG(fmt, ...) \
+    do { if (g_core_verbose) printf("[ServerCore DEBUG] " fmt, ##__VA_ARGS__); } while (0)
 // ---------------------------------------------------------
 // 基础工具函数
 // ---------------------------------------------------------
-
+// void server_core_set_verbose(int level) {
+//     g_core_verbose = level;
+//     // printf("[ServerCore] Verbose level set to: %d\n", level);
+// }
 long long parse_long(const char* str) {
     if (!str) return 0;
     try { return std::stoll(str); } catch (...) { return 0; }
 }
-
 class CryptoUtils {
 public:
     static long derive_seed(long root, const char* purpose, int id) {
@@ -142,6 +145,10 @@ long long lagrange_interpolate_zero(const std::vector<int>& x_coords, const std:
 
 extern "C" {
 
+void server_core_set_verbose(int level) {
+    g_core_verbose = level;
+}
+
 // ---------------------------------------------------------
 // 接口: 聚合与消去 (Server Core Aggregate & Unmask)
 // ---------------------------------------------------------
@@ -163,7 +170,7 @@ void server_core_aggregate_and_unmask(
     std::vector<int> x_coords;
     for(int i=0; i<u2_len; ++i) x_coords.push_back(u2_ids[i] + 1);
 
-    printf("[ServerCore] Recovering Secret Vector (Len=%d) from %d clients...\n", vector_len, u2_len);
+    LOG_DEBUG("[ServerCore] Recovering Secret Vector (Len=%d) from %d clients...\n", vector_len, u2_len);
 
     for (int k = 0; k < vector_len; ++k) {
         std::vector<long long> y_coords;
@@ -177,7 +184,7 @@ void server_core_aggregate_and_unmask(
     // Step 2: 解析秘密向量
     long long delta = reconstructed_secrets[0];
     long long alpha_seed_rec = reconstructed_secrets[1];
-    printf("[ServerCore] RECONSTRUCTED DELTA: %lld\n", delta);
+    LOG_DEBUG("[ServerCore] RECONSTRUCTED DELTA: %lld\n", delta);
 
     std::map<int, long long> beta_map;
     for (int i = 0; i < u1_len; ++i) {
@@ -200,7 +207,7 @@ void server_core_aggregate_and_unmask(
     }
 
     long long coeff_M = MathUtils::safe_mod_sub(1, delta);
-    printf("[ServerCore] Coeff_M (1-Delta): %lld\n", coeff_M);
+    LOG_DEBUG("[ServerCore] Coeff_M (1-Delta): %lld\n", coeff_M);
 
     // Step 4: 流式聚合与消去
     for (int k = 0; k < data_len; ++k) {
@@ -224,6 +231,9 @@ void server_core_aggregate_and_unmask(
 
         // C. 消去: Result = Sum(C) - N
         output_result[k] = MathUtils::safe_mod_sub(sum_cipher_k, noise_k);
+        if (k < 5) {
+            LOG_DEBUG("[ServerCore DEBUG] Aggregated Idx %d: ResultInt=%lld\n", k, output_result[k]);
+        }
     }
 }
 

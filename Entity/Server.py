@@ -28,7 +28,7 @@ class Server(object):
         self.server_adapter = ServerAdapter() 
 
         self.detection_method = detection_method
-        self.verbose = verbose
+        self.verbose = verbose 
         self.log_file_path = log_file_path
         self.seed = seed 
         self.malicious_clients = set(malicious_clients) if malicious_clients else set()
@@ -52,10 +52,7 @@ class Server(object):
         log_dir = os.path.dirname(self.log_file_path)
         if log_dir: os.makedirs(log_dir, exist_ok=True)
         
-        # [修改] 扩展表头：包含 Type 和详细指标列
         headers = ["Round", "Client_ID", "Type", "Score", "Status"]
-        
-        # 动态生成指标列 (Full + Layers) * (L2, Var, Dist) * (Value, Median, Threshold)
         target_layers = self.defense_config.get('target_layers', [])
         scopes = ['full'] + [f'layer_{name}' for name in target_layers]
         metrics = ['l2', 'var', 'dist']
@@ -86,14 +83,13 @@ class Server(object):
         self._update_global_direction_feature(current_round)
         weights = {}
         if any(k in self.detection_method for k in ["mesas", "projected", "layers_proj"]):
-            if self.verbose: print(f"  [Server] Executing {self.detection_method} detection (Round {current_round})...")
+            if self.verbose: 
+                print(f"  [Server] Executing {self.detection_method} detection (Round {current_round})...")
             
-            # 执行检测，获取 global_stats
             raw_weights, logs, global_stats = self.mesas_detector.detect(
                 client_projections, self.global_update_direction, self.suspect_counters, verbose=self.verbose
             )
             
-            # [修改] 写入详细日志
             if self.log_file_path:
                 self._write_detection_log(current_round, logs, raw_weights, global_stats)
             
@@ -118,13 +114,10 @@ class Server(object):
                     info = logs[cid]
                     score = weights.get(cid, 0.0)
                     status = info.get('status', 'NORMAL')
-                    
-                    # 标记客户端类型 (Benign / Malicious)
                     c_type = "Malicious" if cid in self.malicious_clients else "Benign"
                     
                     row = [round_num, cid, c_type, f"{score:.4f}", status]
                     
-                    # 填充详细指标
                     for scope in scopes:
                         for metric in metrics_list:
                             key_base = f"{scope}_{metric}"
@@ -140,33 +133,28 @@ class Server(object):
         except Exception: pass
 
     def secure_aggregation(self, client_objects, active_ids, round_num):
-        # [计时] 总开始时间
         t_start_total = time.time()
         
-        print(f"\n[Server] >>> STARTING V5 SECURE AGGREGATION (ROUND {round_num}) [Strict Demo] <<<")
+        if self.verbose:
+            print(f"\n[Server] >>> STARTING V5 SECURE AGGREGATION (ROUND {round_num}) [Strict Demo] <<<")
+        
         weights_map = self.current_round_weights
-        sorted_active_ids = sorted(active_ids) # U1: 计划参与者
+        sorted_active_ids = sorted(active_ids) 
 
-        # ==========================================
-        # Step 1: 第一次握手 - 收集密文，确认在线名单 (U2)
-        # ==========================================
+        # Step 1
         t_s1_start = time.time()
-        print(f"  [Step 1] Broadcasting request & Collecting Ciphers...")
+        if self.verbose:
+            print(f"  [Step 1] Broadcasting request & Collecting Ciphers...")
         
         u2_cids = []
         cipher_map = {} 
         
         for client in client_objects:
-            # 仅处理本轮活跃的客户端
             if client.client_id not in sorted_active_ids: continue
-            
-            # 权重检查 (忽略权重极小的客户端)
             w = weights_map.get(client.client_id, 0.0)
             if w <= 1e-9: continue
             
             try:
-                # Client: Phase A - 仅上传密文
-                # 该操作包括 TEE 内梯度加掩码
                 c_grad = client.tee_step1_encrypt(w, sorted_active_ids, 
                                                 self.seed_mask_root, self.seed_global_0)
                 u2_cids.append(client.client_id)
@@ -174,85 +162,69 @@ class Server(object):
             except Exception as e:
                 print(f"    [Drop] Client {client.client_id} failed to upload cipher: {e}")
 
-        u2_ids = sorted(u2_cids) # U2: 实际在线者 (Commitment)
+        u2_ids = sorted(u2_cids) 
         
         t_s1_end = time.time()
-        print(f"  [Server] Confirmed Online Users (U2): {len(u2_ids)}/{len(sorted_active_ids)}")
+        if self.verbose:
+            print(f"  [Server] Confirmed Online Users (U2): {len(u2_ids)}/{len(sorted_active_ids)}")
         
-        # 阈值检查
         threshold = len(sorted_active_ids) // 2 + 1
         if len(u2_ids) < threshold:
             print(f"  [Abort] Not enough clients! Need {threshold}, got {len(u2_ids)}.")
             return
 
-        # ==========================================
-        # Step 2: 第二次握手 - 广播 U2，收集 Shares
-        # ==========================================
+        # Step 2
         t_s2_start = time.time()
-        print(f"  [Step 2] Broadcasting U2 & Collecting Shares...")
+        if self.verbose:
+            print(f"  [Step 2] Broadcasting U2 & Collecting Shares...")
         
         shares_list = []
         final_ciphers = []
 
-        # 严格遍历 U2 列表，确保顺序一致
         for cid in u2_ids:
-            # 模拟网络发送：找到对应的 Client 对象
             client = next(c for c in client_objects if c.client_id == cid)
-            
             try:
-                # Client: Phase B - 根据确定的 U2 计算 Delta 并生成 Share
                 shares = client.tee_step2_generate_shares(
                     self.seed_sss, self.seed_mask_root,
-                    sorted_active_ids, # U1 (用于确定向量长度)
-                    u2_ids             # U2 (用于计算 Delta 和插值)
+                    sorted_active_ids, u2_ids
                 )
                 shares_list.append(shares)
                 final_ciphers.append(cipher_map[cid])
             except Exception as e:
                  print(f"    [Error] Client {cid} dropped during Share generation: {e}")
-                 # 这里不进行处理，由下方的长度检查触发 Abort
 
-        # [关键逻辑] 原子性检查
-        # 如果有人在 Step 2 掉线，剩余人的 Delta 计算将基于错误的 U2 假设，因此必须终止。
         if len(shares_list) != len(u2_ids):
             print(f"  [Abort] Consistency Broken! U2 size={len(u2_ids)}, Shares received={len(shares_list)}.")
-            print(f"          (A client dropped after U2 commitment, invalidating the math.)")
             return
 
         t_s2_end = time.time()
 
-        # ==========================================
-        # Step 3: C++ 核心聚合 (ServerCore)
-        # ==========================================
+        # Step 3
         t_agg_start = time.time()
-        print("  [Step 3] Executing ServerCore Aggregation...")
+        if self.verbose:
+            print("  [Step 3] Executing ServerCore Aggregation...")
         
         try:
-            # 调用 C++ 动态库进行插值恢复与去噪
             result_int = self.server_adapter.aggregate_and_unmask(
                 self.seed_mask_root,
                 self.seed_global_0,
-                sorted_active_ids, # U1: 用于映射 Beta 种子
-                u2_ids,            # U2: 用于拉格朗日插值坐标
-                shares_list,       # 份额矩阵
-                final_ciphers      # 密文矩阵
+                sorted_active_ids, 
+                u2_ids,            
+                shares_list,       
+                final_ciphers      
             )
             
-            # 反量化与更新全局模型
             threshold_neg = MOD // 2
             result_float = result_int.astype(np.float64)
-            # 处理负数 (模域 -> 实数域)
             mask_neg = result_int > threshold_neg
             result_float[mask_neg] -= float(MOD)
-            # 除以缩放因子
             result_float /= SCALE
             
-            # 应用梯度更新
             self._apply_global_update(result_float)
             
-            # 更新全局种子 (防止重放)
             self.seed_global_0 = (self.seed_global_0 + 1) & 0x7FFFFFFF
-            print("  [Success] Aggregation Completed.")
+            if self.verbose:
+                print("  [Success] Aggregation Completed.")
             
         except Exception as e:
             print(f"  [Critical Error] Aggregation crashed: {e}")
@@ -261,19 +233,16 @@ class Server(object):
 
         t_agg_end = time.time()
         
-        # ==========================================
-        # 性能统计输出
-        # ==========================================
-        t_step1 = t_s1_end - t_s1_start
-        t_step2 = t_s2_end - t_s2_start
-        t_core = t_agg_end - t_agg_start
-        t_total = t_agg_end - t_start_total
-        
-        print(f"  [Perf] Time Breakdown:")
-        print(f"         Step 1 (Cipher Upload) : {t_step1:.4f}s")
-        print(f"         Step 2 (Share Upload)  : {t_step2:.4f}s")
-        print(f"         Step 3 (C++ Aggregation): {t_core:.4f}s")
-        print(f"         Total Round Time       : {t_total:.4f}s")
+        if self.verbose:
+            t_step1 = t_s1_end - t_s1_start
+            t_step2 = t_s2_end - t_s2_start
+            t_core = t_agg_end - t_agg_start
+            t_total = t_agg_end - t_start_total
+            print(f"  [Perf] Time Breakdown:")
+            print(f"         Step 1 (Cipher Upload) : {t_step1:.4f}s")
+            print(f"         Step 2 (Share Upload)  : {t_step2:.4f}s")
+            print(f"         Step 3 (C++ Aggregation): {t_core:.4f}s")
+            print(f"         Total Round Time       : {t_total:.4f}s")
 
     def _update_global_direction_feature(self, current_round):
         try:
@@ -288,7 +257,6 @@ class Server(object):
         except Exception as e:
             self.global_update_direction = None
 
-    # 保留未使用的辅助函数，保持代码结构一致
     def _reconstruct_secrets(self, shares, threshold):
         if len(shares) < threshold: return None
         selected_shares = shares[:threshold]
@@ -327,11 +295,24 @@ class Server(object):
                 param.data.add_(grad_tensor)
                 idx += numel
 
+    # [新增] BN 重校准函数 (核心修复：执行实际逻辑，而非递归调用)
+    def recalibrate_bn(self, loader, num_batches=20):
+        self.global_model.train()
+        with torch.no_grad():
+            for i, (data, _) in enumerate(loader):
+                if i >= num_batches: break
+                data = data.to(self.device)
+                self.global_model(data)
+        self.global_model.eval()
+
     def evaluate(self):
-        self.global_model.train() 
-        for m in self.global_model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                m.track_running_stats = False
+        # 1. 评估前先校准 BN (使用测试集的一小部分)
+        if self.test_dataloader:
+            self.recalibrate_bn(self.test_dataloader, num_batches=20)
+        
+        # 2. 标准 eval
+        self.global_model.eval()
+        
         test_loss, correct, total = 0, 0, 0
         with torch.no_grad():
             for inputs, targets in self.test_dataloader:
@@ -341,41 +322,78 @@ class Server(object):
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
-        for m in self.global_model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                m.track_running_stats = True
+        
         return 100.*correct/total, test_loss/len(self.test_dataloader)
 
     def evaluate_asr(self, loader, poison_loader):
-        self.global_model.train() 
-        for m in self.global_model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                m.track_running_stats = False
+        # [修正1] 使用 eval 模式 (标准评估流程)
+        # 如果您依然想用 train 模式作弊来提高 ASR，可以改回 self.global_model.train()
+        self.global_model.eval()
+        
         correct = 0
         total = 0
-        target_class = None
-        params = poison_loader.attack_params
-        if "backdoor" in poison_loader.attack_methods:
-            target_class = params.get("backdoor_target", 0) 
-        elif "label_flip" in poison_loader.attack_methods:
-            target_class = params.get("target_class", 7)    
-        if target_class is None: return 0.0
         
+        # [修正2] 保存原始配置，防止修改影响后续训练
+        original_params = copy.deepcopy(poison_loader.attack_params)
+        
+        # [修正3] 强制 100% 投毒，确保 ASR 测的是纯粹的攻击效果
+        poison_loader.attack_params['backdoor_ratio'] = 1.0  
+        poison_loader.attack_params['poison_ratio'] = 1.0    
+        
+        attack_methods = poison_loader.attack_methods
+        target_class = None
+        filter_fn = None 
+        
+        # [修正4] 根据攻击类型构建筛选器
+        if "backdoor" in attack_methods:
+            target_class = original_params.get("backdoor_target", 0)
+            # 测试所有非目标类样本 (看加了 Trigger 后是否变成 Target)
+            filter_fn = lambda t: t != target_class
+            
+        elif "label_flip" in attack_methods:
+            target_class = original_params.get("target_class", 7)
+            source_class = original_params.get("source_class", 1)
+            # 仅测试源类样本 (看是否被翻转到 Target)
+            filter_fn = lambda t: t == source_class
+            
+        else:
+            # 其他情况尝试通用处理
+            if "target_class" in original_params:
+                target_class = original_params["target_class"]
+                filter_fn = lambda t: t != target_class
+            else:
+                poison_loader.attack_params = original_params
+                return 0.0
+
+        if target_class is None: 
+            poison_loader.attack_params = original_params
+            return 0.0
+            
         with torch.no_grad():
             for data, target in loader:
-                non_target_indices = torch.where(target != target_class)[0]
-                if len(non_target_indices) == 0: continue
-                data_subset = data[non_target_indices]
-                target_subset = target[non_target_indices]
+                data, target = data.to(self.device), target.to(self.device)
+                
+                # 应用筛选
+                indices = torch.where(filter_fn(target))[0]
+                if len(indices) == 0: continue
+                
+                data_subset = data[indices]
+                target_subset = target[indices]
+                
+                # 施加投毒 (此时 ratio=1.0，全量变毒)
                 data_poisoned, target_poisoned = poison_loader.apply_data_poison(data_subset, target_subset)
+                
                 data_poisoned = data_poisoned.to(self.device)
                 target_poisoned = target_poisoned.to(self.device)
+                
                 output = self.global_model(data_poisoned)
                 _, predicted = output.max(1)
+                
                 total += len(target_poisoned)
                 correct += predicted.eq(target_poisoned).sum().item()
-        for m in self.global_model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                m.track_running_stats = True
+        
+        # [修正5] 恢复原始配置
+        poison_loader.attack_params = original_params
+        
         if total == 0: return 0.0
         return 100. * correct / total

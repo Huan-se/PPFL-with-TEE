@@ -3,6 +3,7 @@ enclave {
     from "sgx_tstdc.edl" import *;
 
     trusted {
+        public void ecall_set_verbose(int level);
         /* Phase 2: Prepare Gradient */
         public void ecall_prepare_gradient(
             int client_id,

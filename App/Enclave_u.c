@@ -1,6 +1,10 @@
 #include "Enclave_u.h"
 #include <errno.h>
 
+typedef struct ms_ecall_set_verbose_t {
+	int ms_level;
+} ms_ecall_set_verbose_t;
+
 typedef struct ms_ecall_prepare_gradient_t {
 	int ms_client_id;
 	const char* ms_proj_seed_str;
@@ -147,6 +151,15 @@ static const struct {
 		(void*)Enclave_sgx_thread_set_multiple_untrusted_events_ocall,
 	}
 };
+sgx_status_t ecall_set_verbose(sgx_enclave_id_t eid, int level)
+{
+	sgx_status_t status;
+	ms_ecall_set_verbose_t ms;
+	ms.ms_level = level;
+	status = sgx_ecall(eid, 0, &ocall_table_Enclave, &ms);
+	return status;
+}
+
 sgx_status_t ecall_prepare_gradient(sgx_enclave_id_t eid, int client_id, const char* proj_seed_str, float* w_new, float* w_old, size_t model_len, int* ranges, size_t ranges_len, float* output_proj, size_t out_len)
 {
 	sgx_status_t status;
@@ -161,7 +174,7 @@ sgx_status_t ecall_prepare_gradient(sgx_enclave_id_t eid, int client_id, const c
 	ms.ms_ranges_len = ranges_len;
 	ms.ms_output_proj = output_proj;
 	ms.ms_out_len = out_len;
-	status = sgx_ecall(eid, 0, &ocall_table_Enclave, &ms);
+	status = sgx_ecall(eid, 1, &ocall_table_Enclave, &ms);
 	return status;
 }
 
@@ -183,7 +196,7 @@ sgx_status_t ecall_generate_masked_gradient_dynamic(sgx_enclave_id_t eid, const 
 	ms.ms_ranges_len = ranges_len;
 	ms.ms_output = output;
 	ms.ms_out_len = out_len;
-	status = sgx_ecall(eid, 1, &ocall_table_Enclave, &ms);
+	status = sgx_ecall(eid, 2, &ocall_table_Enclave, &ms);
 	return status;
 }
 
@@ -203,7 +216,7 @@ sgx_status_t ecall_get_vector_shares_dynamic(sgx_enclave_id_t eid, const char* s
 	ms.ms_threshold = threshold;
 	ms.ms_output_vector = output_vector;
 	ms.ms_out_max_len = out_max_len;
-	status = sgx_ecall(eid, 2, &ocall_table_Enclave, &ms);
+	status = sgx_ecall(eid, 3, &ocall_table_Enclave, &ms);
 	return status;
 }
 
@@ -215,7 +228,7 @@ sgx_status_t ecall_generate_noise_from_seed(sgx_enclave_id_t eid, const char* se
 	ms.ms_seed_str_len = seed_str ? strlen(seed_str) + 1 : 0;
 	ms.ms_len = len;
 	ms.ms_output = output;
-	status = sgx_ecall(eid, 3, &ocall_table_Enclave, &ms);
+	status = sgx_ecall(eid, 4, &ocall_table_Enclave, &ms);
 	return status;
 }
 

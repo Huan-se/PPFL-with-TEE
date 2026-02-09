@@ -27,6 +27,10 @@
 )
 
 
+typedef struct ms_ecall_set_verbose_t {
+	int ms_level;
+} ms_ecall_set_verbose_t;
+
 typedef struct ms_ecall_prepare_gradient_t {
 	int ms_client_id;
 	const char* ms_proj_seed_str;
@@ -110,6 +114,24 @@ typedef struct ms_sgx_thread_set_multiple_untrusted_events_ocall_t {
 	const void** ms_waiters;
 	size_t ms_total;
 } ms_sgx_thread_set_multiple_untrusted_events_ocall_t;
+
+static sgx_status_t SGX_CDECL sgx_ecall_set_verbose(void* pms)
+{
+	CHECK_REF_POINTER(pms, sizeof(ms_ecall_set_verbose_t));
+	//
+	// fence after pointer checks
+	//
+	sgx_lfence();
+	ms_ecall_set_verbose_t* ms = SGX_CAST(ms_ecall_set_verbose_t*, pms);
+	sgx_status_t status = SGX_SUCCESS;
+
+
+
+	ecall_set_verbose(ms->ms_level);
+
+
+	return status;
+}
 
 static sgx_status_t SGX_CDECL sgx_ecall_prepare_gradient(void* pms)
 {
@@ -695,10 +717,11 @@ err:
 
 SGX_EXTERNC const struct {
 	size_t nr_ecall;
-	struct {void* ecall_addr; uint8_t is_priv; uint8_t is_switchless;} ecall_table[4];
+	struct {void* ecall_addr; uint8_t is_priv; uint8_t is_switchless;} ecall_table[5];
 } g_ecall_table = {
-	4,
+	5,
 	{
+		{(void*)(uintptr_t)sgx_ecall_set_verbose, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_prepare_gradient, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_generate_masked_gradient_dynamic, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_get_vector_shares_dynamic, 0, 0},
@@ -708,16 +731,16 @@ SGX_EXTERNC const struct {
 
 SGX_EXTERNC const struct {
 	size_t nr_ocall;
-	uint8_t entry_table[6][4];
+	uint8_t entry_table[6][5];
 } g_dyn_entry_table = {
 	6,
 	{
-		{0, 0, 0, 0, },
-		{0, 0, 0, 0, },
-		{0, 0, 0, 0, },
-		{0, 0, 0, 0, },
-		{0, 0, 0, 0, },
-		{0, 0, 0, 0, },
+		{0, 0, 0, 0, 0, },
+		{0, 0, 0, 0, 0, },
+		{0, 0, 0, 0, 0, },
+		{0, 0, 0, 0, 0, },
+		{0, 0, 0, 0, 0, },
+		{0, 0, 0, 0, 0, },
 	}
 };
 

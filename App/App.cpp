@@ -18,6 +18,16 @@ void ocall_print_string(const char *str) {
 
 extern "C" {
 
+void tee_set_verbose(int level) {
+    if (global_eid == 0) return; // 还没有初始化 Enclave
+    
+    // 调用 Enclave 的 ECALL 进行设置
+    ecall_set_verbose(global_eid, level);
+    
+    // 如果 Bridge 层自己也有日志，也可以控制
+    // printf("[Bridge] Verbose set to %d\n", level);
+}
+
 int tee_init(const char* enclave_path) {
     if (global_eid != 0) return 0;
     sgx_status_t ret = sgx_create_enclave(enclave_path, SGX_DEBUG_FLAG, NULL, NULL, &global_eid, NULL);

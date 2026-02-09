@@ -32,6 +32,16 @@ class ServerAdapter:
             ctypes.c_int, # data_len
             np.ctypeslib.ndpointer(dtype=np.int64, flags='C_CONTIGUOUS')  # output_result
         ]
+        
+        try:
+            self.lib.server_core_set_verbose.argtypes = [ctypes.c_int]
+            self.lib.server_core_set_verbose.restype = None
+        except: pass
+
+    def set_verbose(self, verbose_bool):
+        level = 1 if verbose_bool else 0
+        if self.lib:
+            self.lib.server_core_set_verbose(level)
 
     # [关键修复] 补全缺失的辅助函数
     def _to_bytes(self, val):

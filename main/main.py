@@ -17,9 +17,10 @@ sys.path.append(parent_dir)
 from Entity.Client import Client
 from Entity.Server import Server
 from _utils_.tee_adapter import get_tee_adapter_singleton
+# [新增] 引入 ServerAdapter 以便设置日志开关
+from _utils_.server_adapter import ServerAdapter 
 from _utils_.dataloader import load_and_split_dataset
 from _utils_.poison_loader import PoisonLoader
-# [新增] 引入保存配置的工具
 from _utils_.save_config import save_result_with_config, check_result_exists, get_result_filename
 from model.Cifar10Net import CIFAR10Net
 from model.Lenet5 import LeNet5
@@ -53,15 +54,24 @@ def flatten_params(model):
     return np.concatenate(params).astype(np.float32)
 
 def run_single_mode(full_config, mode_name, current_mode_config):
+    # 获取 verbose 开关 (默认为 False)
+    exp_conf = full_config['experiment']
+    verbose_flag = exp_conf.get('verbose', False)
+
+    # [新增] 定义受控打印函数
+    def log(*args, **kwargs):
+        if verbose_flag:
+            print(*args, **kwargs)
+
     print(f"\n=================================================================")
     print(f"  Configuration Summary | Mode: {mode_name}")
+    print(f"  Verbose Logging: {'ON' if verbose_flag else 'OFF'}")
     print(f"=================================================================")
     
-    exp_conf = full_config['experiment']
     fed_conf = full_config['federated']
     data_conf = full_config['data']
     atk_conf = full_config['attack']
-    defense_conf = full_config['defense'] # 获取 defense 配置
+    defense_conf = full_config['defense']
     
     seed = exp_conf['seed']
     random.seed(seed)
@@ -70,8 +80,8 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True  # 强制确定性算法
-        torch.backends.cudnn.benchmark = False     # 禁用自动调优
+        torch.backends.cudnn.deterministic = True 
+        torch.backends.cudnn.benchmark = False
     
     device_str = exp_conf.get('device', 'auto')
     if device_str == 'auto':
@@ -80,11 +90,11 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     
     use_multiprocessing = exp_conf.get('use_multiprocessing', False)
     worker_count = exp_conf.get('thread_count', 4)
-    log_interval = exp_conf.get('log_interval', 100) # 获取日志间隔配置
+    log_interval = exp_conf.get('log_interval', 100)
     
     save_dir = os.path.join(current_dir, "results")
     
-    # [新增] 检查结果是否存在
+    # 检查结果是否存在
     detection_method = current_mode_config.get('defense_method', 'none')
     exists, _ = check_result_exists(
         save_dir, mode_name, data_conf['model'], data_conf['dataset'], 
@@ -119,7 +129,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     else:
         print(f"  [Attack] Malicious Clients: None")
 
-    # [新增] 准备日志路径
+    # 准备日志路径
     log_file_path = None
     if any(k in detection_method for k in ["mesas", "projected", "layers_proj"]):
         log_filename = get_result_filename(mode_name, data_conf['model'], data_conf['dataset'], detection_method, current_mode_config).replace('.npz', '_detection_log.csv')
@@ -131,11 +141,11 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         test_dataloader=test_loader,
         device_str=device_str,
         detection_method=detection_method, 
-        defense_config=defense_conf, # 传入全局 defense 配置
+        defense_config=defense_conf,
         seed=seed,
-        verbose=True,
-        log_file_path=log_file_path,        # [新增] 传入日志路径
-        malicious_clients=poison_client_ids # [新增] 传入恶意 ID 列表
+        verbose=verbose_flag,               # [修改] 跟随 config 开关
+        log_file_path=log_file_path,
+        malicious_clients=poison_client_ids
     )
     
     # Init Clients
@@ -145,7 +155,6 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     attack_idx = 0
     primary_attack_type = active_attacks[0] if active_attacks else None
     
-    # Server Poison Loader for ASR testing
     server_poison_loader = None
     if primary_attack_type:
         server_poison_loader = PoisonLoader([primary_attack_type], attack_params_dict.get(primary_attack_type, {}))
@@ -158,20 +167,37 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             a_params = attack_params_dict.get(a_type, {})
             client_poison_loader = PoisonLoader([a_type], a_params)
         
-        # [修改] 传入 log_interval
-        c = Client(cid, all_client_dataloaders[cid], ModelClass, client_poison_loader, device_str=device_str, verbose=(cid==0), log_interval=log_interval)
+        # [修改] 只有当 verbose_flag=True 且是第一个客户端时，才允许 Client 内部打印
+        c_verbose = (verbose_flag and cid == 0)
+        c = Client(cid, all_client_dataloaders[cid], ModelClass, client_poison_loader, device_str=device_str, verbose=c_verbose, log_interval=log_interval)
         c.learning_rate = fed_conf.get('lr', 0.01)
         c.local_epochs = fed_conf.get('local_epochs', 1)
         clients.append(c)
 
-    # Pre-init TEE
+    # Pre-init TEE & Configure Logging
     print("  [System] Pre-initializing TEE Enclave (Global Singleton)...")
-    _ = get_tee_adapter_singleton()
-    _.initialize_enclave()
     
+    # 1. 获取 TEE Adapter 实例并初始化
+    tee_adapter = get_tee_adapter_singleton()
+    tee_adapter.initialize_enclave()
+    
+    # 2. [关键] 设置 TEE (Enclave + Bridge) 的日志开关
+    # 增加 try-catch 防止 C++ 库未更新导致 Crash
+    try:
+        if hasattr(tee_adapter, 'set_verbose'):
+            tee_adapter.set_verbose(verbose_flag)
+    except Exception as e:
+        print(f"  [Warning] Failed to set TEE verbose: {e}")
+    
+    # 3. [关键] 设置 ServerCore (C++ 聚合层) 的日志开关
+    try:
+        temp_server_adapter = ServerAdapter()
+        if hasattr(temp_server_adapter, 'set_verbose'):
+            temp_server_adapter.set_verbose(verbose_flag)
+    except Exception as e:
+        print(f"  [Warning] Failed to set ServerCore verbose: {e}")
+
     total_rounds = fed_conf['comm_rounds']
-    
-    # [新增] 完整记录器
     acc_history = []
     asr_history = []
     loss_history = []
@@ -179,7 +205,8 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     start_time = time.time()
     
     for r in range(1, total_rounds + 1):
-        print(f"\n>>> Round {r}/{total_rounds} Start...")
+        # 使用 log() 替代 print()，受 verbose_flag 控制
+        log(f"\n>>> Round {r}/{total_rounds} Start...")
         round_start_time = time.time()
         
         active_ids = random.sample(range(fed_conf['total_clients']), fed_conf['active_clients'])
@@ -192,7 +219,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
 
         # Phase 1
         train_workers = 1 if "cuda" in device_str else min(5, worker_count)
-        print(f"  [Phase 1] Starting Local Training (Device: {device_str}, Workers: {train_workers})...")
+        log(f"  [Phase 1] Starting Local Training (Device: {device_str}, Workers: {train_workers})...")
         t_p1_start = time.time()
         if use_multiprocessing:
             with ThreadPoolExecutor(max_workers=train_workers) as executor:
@@ -203,11 +230,11 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         else:
             for cid in active_ids: task_phase1_train(clients[cid], None)
         t_p1_end = time.time()
-        print(f"  >> Training Phase Finished in {t_p1_end - t_p1_start:.2f}s")
+        log(f"  >> Training Phase Finished in {t_p1_end - t_p1_start:.2f}s")
 
         # Phase 2
         tee_workers = worker_count 
-        print(f"  [Phase 2] Starting TEE Processing (Workers: {tee_workers})...")
+        log(f"  [Phase 2] Starting TEE Processing (Workers: {tee_workers})...")
         t_p2_start = time.time()
         client_features_dict_list = {}
         client_data_sizes = {}
@@ -228,14 +255,13 @@ def run_single_mode(full_config, mode_name, current_mode_config):
                     client_features_dict_list[cid] = feats
                     client_data_sizes[cid] = dsize
         t_p2_end = time.time()
-        print(f"  >> TEE Phase Finished in {t_p2_end - t_p2_start:.2f}s")
+        log(f"  >> TEE Phase Finished in {t_p2_end - t_p2_start:.2f}s")
 
         # Phase 3
         valid_ids = [cid for cid in active_ids if cid in client_features_dict_list]
         feature_list = [client_features_dict_list[cid] for cid in valid_ids]
         size_list = [client_data_sizes[cid] for cid in valid_ids]
         
-        # [关键] 这一步 Server 会自动写入 CSV 日志
         weights_map = server.calculate_weights(valid_ids, feature_list, size_list, current_round=r)
         
         accepted_ids = [cid for cid, w in weights_map.items() if w > 1e-6]
@@ -253,19 +279,20 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         loss_history.append(loss)
         
         round_end_time = time.time()
+        
+        # [关键] 无论 verbose 如何，Round 结果始终打印
         print(f"  [Round {r}] Global Acc: {acc:.2f}%, Loss: {loss:.4f}")
         
-        # [新增] ASR 评估与记录
-        if server_poison_loader and current_poison_ratio > 0:
+        # if server_poison_loader and current_poison_ratio > 0:
+        if server_poison_loader:
             asr = server.evaluate_asr(test_loader, server_poison_loader)
             asr_history.append(asr)
             print(f"  [Round {r}] ASR: {asr:.2f}%")
         else:
             asr_history.append(0.0)
             
-        print(f"  Time Breakdown: Train={t_p1_end-t_p1_start:.1f}s, TEE={t_p2_end-t_p2_start:.1f}s, Agg={round_end_time-t_p2_end:.1f}s")
+        log(f"  Time Breakdown: Train={t_p1_end-t_p1_start:.1f}s, TEE={t_p2_end-t_p2_start:.1f}s, Agg={round_end_time-t_p2_end:.1f}s")
 
-    # [关键] 循环结束后统一保存结果配置
     print("\n[Saving] Saving final results...")
     save_result_with_config(
         save_dir,
@@ -276,8 +303,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         current_mode_config,
         acc_history,
         asr_history,
-        # loss_history 参数可能在明文仓库的 save_config 中不一定支持，但通常我们保存 acc 和 asr 即可
-        # 如果需要保存 loss，可以手动扩展 save_config.py，这里仅传递标准参数
+        loss_history=loss_history
     )
     print(f"[Done] Mode {mode_name} Finished.")
 

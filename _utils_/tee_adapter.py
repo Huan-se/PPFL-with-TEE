@@ -27,6 +27,16 @@ class TEEAdapter:
         
         self._load_library()
         self._init_functions()
+        try:
+            self.lib.tee_set_verbose.argtypes = [ctypes.c_int]
+            self.lib.tee_set_verbose.restype = None
+        except Exception:
+            print("[Warning] tee_set_verbose not found in library.")
+    
+    def set_verbose(self, verbose_bool):
+        level = 1 if verbose_bool else 0
+        if self.initialized:
+            self.lib.tee_set_verbose(level)
 
     def _load_library(self):
         if not os.path.exists(self.lib_path):
