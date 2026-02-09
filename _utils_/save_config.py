@@ -1,97 +1,103 @@
-import matplotlib.pyplot as plt
-import numpy as np
 import os
 import json
+import numpy as np
+import matplotlib.pyplot as plt
+import datetime
 
 def get_result_filename(mode_name, model_type, dataset_type, detection_method, config):
     """
-    生成具有可读性的唯一结果文件名
+    根据配置生成唯一的文件名标识
+    格式: {mode}_{model}_{data}_{defense}_{attack}_{ratio}_{iid}
     """
-    attacks = config.get('attack_types', [])
-    # 兼容 active_attacks 字段
-    if not attacks:
-        attacks = config.get('active_attacks', [])
-
-    if isinstance(attacks, list):
-        if not attacks or config.get('poison_ratio', 0) == 0:
-            attack_str = "NoAttack"
-        else:
-            # 简化攻击名称，避免文件名过长
-            attack_str = "+".join(sorted([str(a) for a in attacks]))
-    else:
-        attack_str = str(attacks)
-
+    attack_type = "NoAttack"
     poison_ratio = config.get('poison_ratio', 0.0)
-    pr_str = f"p{poison_ratio:.2f}"
-
-    is_noniid = config.get('if_noniid', False)
-    alpha = config.get('alpha', '')
-    if is_noniid:
-        dist_str = f"NonIID_a{alpha}"
-    else:
-        dist_str = "IID"
-
-    # 增加维度信息到文件名（如果存在），避免不同维度的矩阵结果混淆
-    proj_dim = config.get('defense', {}).get('projection_dim', 1024) if 'defense' in config else 1024
-    if "mesas" in detection_method or "projected" in detection_method or "layers_proj" in detection_method:
-        dim_str = f"_dim{proj_dim}"
-    else:
-        dim_str = ""
-
-    filename = f"{mode_name}_{model_type}_{dataset_type}_{detection_method}{dim_str}_{attack_str}_{pr_str}_{dist_str}.npz"
-    filename = filename.replace(" ", "").replace("'", "").replace('"', "")
+    
+    # 获取攻击类型 (如果有)
+    if poison_ratio > 0:
+        # 尝试从 config['attack_types'] 或 config 中获取
+        atks = config.get('attack_types', [])
+        if not atks and 'attack' in config:
+             atks = config['attack'].get('active_attacks', [])
+        
+        if atks:
+            attack_type = "+".join(atks)
+        else:
+            attack_type = "UnknownAttack"
+    
+    iid_status = "NonIID" if config.get('if_noniid', False) else "IID"
+    
+    filename = f"{mode_name}_{model_type}_{dataset_type}_{detection_method}_{attack_type}_p{poison_ratio:.2f}_{iid_status}"
     return filename
 
 def check_result_exists(save_dir, mode_name, model_type, dataset_type, detection_method, config):
-    """检查结果是否已存在"""
-    os.makedirs(save_dir, exist_ok=True)
-    filename = get_result_filename(mode_name, model_type, dataset_type, detection_method, config)
-    filepath = os.path.join(save_dir, filename)
+    """检查结果文件是否已存在"""
+    if not os.path.exists(save_dir):
+        return False, None
+        
+    filename_base = get_result_filename(mode_name, model_type, dataset_type, detection_method, config)
+    json_path = os.path.join(save_dir, f"{filename_base}_config.json")
+    npz_path = os.path.join(save_dir, f"{filename_base}_data.npz")
     
-    if os.path.exists(filepath):
-        print(f"✅ [Skip] 结果已存在: {filename}")
+    if os.path.exists(json_path) and os.path.exists(npz_path):
         try:
-            data = np.load(filepath, allow_pickle=True)
-            return True, data
-        except Exception as e:
-            print(f"⚠️ 文件存在但读取失败 ({e})，将重新训练。")
+            with open(json_path, 'r') as f:
+                saved_data = json.load(f)
+            return True, saved_data
+        except:
             return False, None
     return False, None
 
 def save_result_with_config(save_dir, mode_name, model_type, dataset_type, detection_method, config, accuracy_history, asr_history=None, loss_history=None):
-    """
-    保存结果(.npz)和配置(.json)
-    [适配] 新增 loss_history 参数，用于记录训练过程中的 Loss 变化
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    filename = get_result_filename(mode_name, model_type, dataset_type, detection_method, config)
-    filepath = os.path.join(save_dir, filename)
-    
-    # 构建保存字典
-    save_dict = {'accuracy_history': accuracy_history}
-    
-    # 保存 ASR
-    if asr_history is not None and len(asr_history) > 0:
-        save_dict['asr_history'] = asr_history
-    
-    # [修改] 保存 Loss
-    if loss_history is not None and len(loss_history) > 0:
-        save_dict['loss_history'] = loss_history
+    """保存配置文件(JSON)和实验数据(NPZ)"""
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
         
-    np.savez(filepath, **save_dict)
+    filename_base = get_result_filename(mode_name, model_type, dataset_type, detection_method, config)
     
-    config_file = filepath.replace('.npz', '_config.json')
+    # 1. 保存 Config (JSON)
+    json_path = os.path.join(save_dir, f"{filename_base}_config.json")
+    save_content = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "config": config,
+        "results": {
+            "final_accuracy": accuracy_history[-1] if accuracy_history else 0.0,
+            "final_asr": asr_history[-1] if asr_history else 0.0,
+            "max_accuracy": max(accuracy_history) if accuracy_history else 0.0
+        },
+        "accuracy_history": accuracy_history,
+        "asr_history": asr_history if asr_history else [],
+        "loss_history": loss_history if loss_history else []
+    }
     
-    def convert(o):
-        if isinstance(o, np.generic): return o.item()
-        if isinstance(o, set): return list(o) # 增加对 set 类型的支持
-        raise TypeError
+    # [修复] indent 参数移入 json.dump
+    with open(json_path, 'w') as f:
+        json.dump(save_content, f, indent=4)
         
-    with open(config_file, 'w') as f:
-        json.dump(config, f, indent=4, default=convert)
+    # 2. 保存数据 (NPZ)
+    npz_path = os.path.join(save_dir, f"{filename_base}_data.npz")
+    np.savez(
+        npz_path, 
+        accuracy=accuracy_history, 
+        asr=asr_history if asr_history else [],
+        loss=loss_history if loss_history else []
+    )
     
-    print(f"💾 结果已保存: {filename}")
-    return filepath
+    # 3. 绘图 (PNG)
+    png_path = os.path.join(save_dir, f"{filename_base}_curve.png")
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(accuracy_history)+1), accuracy_history, label='Main Task Accuracy', marker='o')
+    if asr_history and len(asr_history) > 0 and max(asr_history) > 0:
+        plt.plot(range(1, len(asr_history)+1), asr_history, label='Backdoor ASR', marker='x', linestyle='--')
+    
+    plt.title(f"Performance: {filename_base}")
+    plt.xlabel("Communication Rounds")
+    plt.ylabel("Rate (%)")
+    plt.grid(True)
+    plt.legend()
+    plt.savefig(png_path)
+    plt.close()
+    
+    print(f"[Save] Result saved to {filename_base} (.json/.npz/.png)")
 
 def plot_comparison_curves(config=None, result_dir="results", save_path="comparison.png"):
     """绘制对比曲线"""

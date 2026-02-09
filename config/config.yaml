@@ -39,25 +39,25 @@ defense:
   target_layers: 
     # - "conv1.weight"
     - "fc.weight"
-params:
-    clustering_method: "kmeans"
-    
-    dist_threshold_multiplier: 3.5  # 软筛查阈值 (Median + k * MAD)
-    score_decay_rate: 2.0           # 非线性衰减率 (值越大越严格)
-    
-    # 统计筛除参数 (硬筛查)
-    l2_threshold_multiplier: 4
-    var_threshold_multiplier: 4
-    
-    # 评分参数
-    base_good_score: 1.0     # [修改] 配合代码逻辑，基础分通常设为 1.0
-    suspect_score: 0.01       # 疑似分固定为 1.0
-    max_bonus: 100.0       # 奖励分
-    strike_threshold: 33
+  params:
+      clustering_method: "kmeans"
+      
+      dist_threshold_multiplier: 3.5  # 软筛查阈值 (Median + k * MAD)
+      score_decay_rate: 2.0           # 非线性衰减率 (值越大越严格)
+      
+      # 统计筛除参数 (硬筛查)
+      l2_threshold_multiplier: 4
+      var_threshold_multiplier: 4
+      
+      # 评分参数
+      base_good_score: 1.0     # [修改] 配合代码逻辑，基础分通常设为 1.0
+      suspect_score: 0.01       # 疑似分固定为 1.0
+      max_bonus: 100.0       # 奖励分
+      strike_threshold: 33
 
-    # DBSCAN 参数 (备用，KMeans模式下不生效)
-    dbscan_eps: 0.5
-    dbscan_min_samples: 2
+      # DBSCAN 参数 (备用，KMeans模式下不生效)
+      dbscan_eps: 0.5
+      dbscan_min_samples: 2
 
 # ================= 攻击策略配置 =================
 attack:

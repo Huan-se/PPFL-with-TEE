@@ -19,7 +19,6 @@ from Entity.Server import Server
 from _utils_.tee_adapter import get_tee_adapter_singleton
 from _utils_.dataloader import load_and_split_dataset
 from _utils_.poison_loader import PoisonLoader
-# [新增] 引入保存配置的工具
 from _utils_.save_config import save_result_with_config, check_result_exists, get_result_filename
 from model.Cifar10Net import CIFAR10Net
 from model.Lenet5 import LeNet5
@@ -61,7 +60,6 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     fed_conf = full_config['federated']
     data_conf = full_config['data']
     atk_conf = full_config['attack']
-    defense_conf = full_config['defense'] # 获取 defense 配置
     
     seed = exp_conf['seed']
     random.seed(seed)
@@ -80,15 +78,13 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     
     use_multiprocessing = exp_conf.get('use_multiprocessing', False)
     worker_count = exp_conf.get('thread_count', 4)
-    log_interval = exp_conf.get('log_interval', 100) # 获取日志间隔配置
     
     save_dir = os.path.join(current_dir, "results")
     
-    # [新增] 检查结果是否存在
-    detection_method = current_mode_config.get('defense_method', 'none')
+    # Check exists
     exists, _ = check_result_exists(
         save_dir, mode_name, data_conf['model'], data_conf['dataset'], 
-        detection_method, current_mode_config
+        current_mode_config.get('defense_method', 'none'), current_mode_config
     )
     if exists:
         print(f"[Skip] Mode {mode_name} already exists.")
@@ -119,7 +115,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     else:
         print(f"  [Attack] Malicious Clients: None")
 
-    # [新增] 准备日志路径
+    detection_method = current_mode_config.get('defense_method', 'none')
     log_file_path = None
     if any(k in detection_method for k in ["mesas", "projected", "layers_proj"]):
         log_filename = get_result_filename(mode_name, data_conf['model'], data_conf['dataset'], detection_method, current_mode_config).replace('.npz', '_detection_log.csv')
@@ -131,11 +127,11 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         test_dataloader=test_loader,
         device_str=device_str,
         detection_method=detection_method, 
-        defense_config=defense_conf, # 传入全局 defense 配置
+        defense_config=full_config.get('defense', {}),
         seed=seed,
         verbose=True,
-        log_file_path=log_file_path,        # [新增] 传入日志路径
-        malicious_clients=poison_client_ids # [新增] 传入恶意 ID 列表
+        log_file_path=log_file_path,
+        malicious_clients=poison_client_ids
     )
     
     # Init Clients
@@ -158,8 +154,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             a_params = attack_params_dict.get(a_type, {})
             client_poison_loader = PoisonLoader([a_type], a_params)
         
-        # [修改] 传入 log_interval
-        c = Client(cid, all_client_dataloaders[cid], ModelClass, client_poison_loader, device_str=device_str, verbose=(cid==0), log_interval=log_interval)
+        c = Client(cid, all_client_dataloaders[cid], ModelClass, client_poison_loader, device_str=device_str, verbose=(cid==0))
         c.learning_rate = fed_conf.get('lr', 0.01)
         c.local_epochs = fed_conf.get('local_epochs', 1)
         clients.append(c)
@@ -235,9 +230,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         feature_list = [client_features_dict_list[cid] for cid in valid_ids]
         size_list = [client_data_sizes[cid] for cid in valid_ids]
         
-        # [关键] 这一步 Server 会自动写入 CSV 日志
         weights_map = server.calculate_weights(valid_ids, feature_list, size_list, current_round=r)
-        
         accepted_ids = [cid for cid, w in weights_map.items() if w > 1e-6]
         accepted_ids.sort()
         
@@ -250,12 +243,11 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         # Eval
         acc, loss = server.evaluate()
         acc_history.append(acc)
-        loss_history.append(loss)
+        loss_history.append(loss) # [新增]
         
         round_end_time = time.time()
         print(f"  [Round {r}] Global Acc: {acc:.2f}%, Loss: {loss:.4f}")
         
-        # [新增] ASR 评估与记录
         if server_poison_loader and current_poison_ratio > 0:
             asr = server.evaluate_asr(test_loader, server_poison_loader)
             asr_history.append(asr)
@@ -265,7 +257,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             
         print(f"  Time Breakdown: Train={t_p1_end-t_p1_start:.1f}s, TEE={t_p2_end-t_p2_start:.1f}s, Agg={round_end_time-t_p2_end:.1f}s")
 
-    # [关键] 循环结束后统一保存结果配置
+    # [关键修改] 循环结束后统一保存
     print("\n[Saving] Saving final results...")
     save_result_with_config(
         save_dir,
@@ -276,17 +268,14 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         current_mode_config,
         acc_history,
         asr_history,
-        # loss_history 参数可能在明文仓库的 save_config 中不一定支持，但通常我们保存 acc 和 asr 即可
-        # 如果需要保存 loss，可以手动扩展 save_config.py，这里仅传递标准参数
+        loss_history
     )
     print(f"[Done] Mode {mode_name} Finished.")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='../config/config.yaml')
-    parser.add_argument('--mode', type=str, default=None, help='指定只运行某个模式(逗号分隔)')
     args = parser.parse_args()
-    
     config = load_config(args.config)
     
     base_flat_config = {
@@ -319,16 +308,12 @@ def main():
         }
     ]
     
-    target_modes_str = args.mode
-    if target_modes_str is None: target_modes_str = config['experiment'].get('modes', 'all')
-    
+    target_modes_str = config['experiment'].get('modes', 'all')
     if target_modes_str == 'all':
         modes_to_run = all_modes
     else:
         target_names = [m.strip() for m in target_modes_str.split(',')]
         modes_to_run = [m for m in all_modes if m['name'] in target_names]
-
-    print(f"计划运行模式: {[m['name'] for m in modes_to_run]}")
 
     for mode in modes_to_run:
         run_single_mode(config, mode['name'], mode['mode_config'])

@@ -11,11 +11,11 @@ from Defence.score import ScoreCalculator
 from Defence.kickout import KickoutManager
 from Defence.layers_proj_detect import Layers_Proj_Detector
 from _utils_.tee_adapter import get_tee_adapter_singleton
-from _utils_.server_adapter import ServerAdapter # [新增]
+from _utils_.server_adapter import ServerAdapter 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MOD = 9223372036854775783
-SCALE = 100000000.0 # [同步修改] 与 Enclave 保持一致
+SCALE = 100000000.0 
 
 class Server(object):
     def __init__(self, model_class, test_dataloader, device_str, detection_method="none", defense_config=None, seed=42, verbose=False, log_file_path=None, malicious_clients=None):
@@ -25,7 +25,7 @@ class Server(object):
         self.criterion = nn.CrossEntropyLoss().to(self.device)
         
         self.tee_adapter = get_tee_adapter_singleton()
-        self.server_adapter = ServerAdapter() # [新增] C++ Server Core
+        self.server_adapter = ServerAdapter() 
 
         self.detection_method = detection_method
         self.verbose = verbose
@@ -45,15 +45,30 @@ class Server(object):
         self.seed_global_0 = 0x87654321  
         self.seed_sss = 0x11223344
         self.w_old_global_flat = self._flatten_params(self.global_model)
+        
         if self.log_file_path: self._init_log_file()
 
     def _init_log_file(self):
         log_dir = os.path.dirname(self.log_file_path)
         if log_dir: os.makedirs(log_dir, exist_ok=True)
+        
+        # [修改] 扩展表头：包含 Type 和详细指标列
+        headers = ["Round", "Client_ID", "Type", "Score", "Status"]
+        
+        # 动态生成指标列 (Full + Layers) * (L2, Var, Dist) * (Value, Median, Threshold)
+        target_layers = self.defense_config.get('target_layers', [])
+        scopes = ['full'] + [f'layer_{name}' for name in target_layers]
+        metrics = ['l2', 'var', 'dist']
+        
+        for scope in scopes:
+            for metric in metrics:
+                base = f"{scope}_{metric}"
+                headers.extend([base, f"{base}_median", f"{base}_threshold"])
+        
         try:
             with open(self.log_file_path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Round", "Client_ID", "Score", "Status"])
+                writer.writerow(headers)
         except Exception: pass
         
     def _flatten_params(self, model):
@@ -72,10 +87,16 @@ class Server(object):
         weights = {}
         if any(k in self.detection_method for k in ["mesas", "projected", "layers_proj"]):
             if self.verbose: print(f"  [Server] Executing {self.detection_method} detection (Round {current_round})...")
+            
+            # 执行检测，获取 global_stats
             raw_weights, logs, global_stats = self.mesas_detector.detect(
                 client_projections, self.global_update_direction, self.suspect_counters, verbose=self.verbose
             )
-            # Log & Weights logic...
+            
+            # [修改] 写入详细日志
+            if self.log_file_path:
+                self._write_detection_log(current_round, logs, raw_weights, global_stats)
+            
             total_score = sum(raw_weights.values())
             weights = {cid: s / total_score for cid, s in raw_weights.items()} if total_score > 0 else {cid: 0.0 for cid in raw_weights}
         else:
@@ -85,6 +106,11 @@ class Server(object):
 
     def _write_detection_log(self, round_num, logs, weights, global_stats):
         if not self.log_file_path: return
+        
+        target_layers = self.defense_config.get('target_layers', [])
+        scopes = ['full'] + [f'layer_{name}' for name in target_layers]
+        metrics_list = ['l2', 'var', 'dist']
+
         try:
             with open(self.log_file_path, 'a', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
@@ -92,8 +118,24 @@ class Server(object):
                     info = logs[cid]
                     score = weights.get(cid, 0.0)
                     status = info.get('status', 'NORMAL')
-                    row = [round_num, cid, "Client", f"{score:.4f}", status]
-                    # 补充 metric 详情... (这里简化处理，只写基本信息)
+                    
+                    # 标记客户端类型 (Benign / Malicious)
+                    c_type = "Malicious" if cid in self.malicious_clients else "Benign"
+                    
+                    row = [round_num, cid, c_type, f"{score:.4f}", status]
+                    
+                    # 填充详细指标
+                    for scope in scopes:
+                        for metric in metrics_list:
+                            key_base = f"{scope}_{metric}"
+                            val = info.get(key_base, 0)
+                            median = global_stats.get(f"{key_base}_median", 0)
+                            thresh = global_stats.get(f"{key_base}_threshold", 0)
+                            
+                            row.append(f"{val:.4f}")
+                            row.append(f"{median:.4f}")
+                            row.append(f"{thresh:.4f}")
+                    
                     writer.writerow(row)
         except Exception: pass
 
@@ -246,6 +288,7 @@ class Server(object):
         except Exception as e:
             self.global_update_direction = None
 
+    # 保留未使用的辅助函数，保持代码结构一致
     def _reconstruct_secrets(self, shares, threshold):
         if len(shares) < threshold: return None
         selected_shares = shares[:threshold]

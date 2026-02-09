@@ -1,0 +1,48 @@
+{
+    "timestamp": "2026-02-08 22:45:57",
+    "config": {
+        "total_clients": 20,
+        "batch_size": 64,
+        "comm_rounds": 10,
+        "if_noniid": false,
+        "alpha": 0.5,
+        "attack_types": [
+            "backdoor"
+        ],
+        "seed": 42,
+        "model_type": "cifar10",
+        "dataset_type": "cifar10",
+        "poison_ratio": 0.2,
+        "defense_method": "layers_proj_detect"
+    },
+    "results": {
+        "final_accuracy": 72.56,
+        "final_asr": 65.73333333333333,
+        "max_accuracy": 72.56
+    },
+    "accuracy_history": [
+        46.49,
+        56.79,
+        61.17,
+        64.66,
+        67.82,
+        68.84,
+        70.3,
+        71.34,
+        71.55,
+        72.56
+    ],
+    "asr_history": [
+        40.74444444444445,
+        51.25555555555555,
+        54.977777777777774,
+        58.2,
+        60.922222222222224,
+        62.44444444444444,
+        64.03333333333333,
+        65.23333333333333,
+        65.21111111111111,
+        65.73333333333333
+    ],
+    "loss_history": []
+}

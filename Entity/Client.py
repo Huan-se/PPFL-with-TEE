@@ -6,12 +6,13 @@ import numpy as np
 from _utils_.tee_adapter import get_tee_adapter_singleton
 
 class Client(object):
-    def __init__(self, client_id, train_loader, model_class, poison_loader, device_str='cuda', verbose=False):
+    def __init__(self, client_id, train_loader, model_class, poison_loader, device_str='cuda', verbose=False, log_interval=50):
         self.client_id = client_id
         self.train_loader = train_loader
         self.model_class = model_class 
         self.poison_loader = poison_loader 
         self.verbose = verbose
+        self.log_interval = log_interval # [新增] 用于控制日志打印频率
         
         if device_str == 'cuda' and torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -63,7 +64,7 @@ class Client(object):
         if self.poison_loader and self.poison_loader.attack_methods:
             self.poison_loader.attack_params['local_epochs'] = run_epochs
             
-            # PoisonLoader 内部需要增加 clip_grad_norm 的逻辑，或者在这里只能信任它
+            # PoisonLoader 内部执行攻击
             new_state_dict, _ = self.poison_loader.execute_attack(
                 model=self.model,
                 dataloader=self.train_loader,
@@ -87,8 +88,11 @@ class Client(object):
                     
                     # 梯度裁剪
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=MAX_GRAD_NORM)
-                    
                     optimizer.step()
+
+                    # [新增] 打印 Loss 日志
+                    if self.verbose and batch_idx % self.log_interval == 0:
+                        print(f"    [Client {self.client_id}] Epoch {epoch+1}/{run_epochs} | Batch {batch_idx}/{len(self.train_loader)} | Loss: {loss.item():.4f}")
         
         t_end = time.time()
         return t_end - t_start
